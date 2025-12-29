@@ -428,7 +428,14 @@ class FreeCADRPC:
             return str(e)
 
 
-def start_rpc_server(host="localhost", port=9875):
+def start_rpc_server(host="0.0.0.0", port=9875):
+    """Start the XML-RPC server.
+
+    Args:
+        host: Bind address. Default "0.0.0.0" allows connections from WSL and network.
+              Use "localhost" to restrict to local connections only.
+        port: Port number (default 9875)
+    """
     global rpc_server_thread, rpc_server_instance
 
     if rpc_server_instance:
@@ -441,6 +448,8 @@ def start_rpc_server(host="localhost", port=9875):
 
     def server_loop():
         FreeCAD.Console.PrintMessage(f"RPC Server started at {host}:{port}\n")
+        if host == "0.0.0.0":
+            FreeCAD.Console.PrintMessage("  Accepting connections from all interfaces (including WSL)\n")
         rpc_server_instance.serve_forever()
 
     rpc_server_thread = threading.Thread(target=server_loop, daemon=True)

@@ -1,11 +1,102 @@
 import json
 import logging
+import os
+import subprocess
 import xmlrpc.client
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
+
+# Import contract tools for process engineering
+from .contract_tools import register_contract_tools
+from .techdraw_tools import register_techdraw_tools
+from .response_filters import DetailLevel, filter_object_properties, filter_objects_list
+
+
+def get_windows_host_ip() -> str:
+    """Detect Windows host IP when running in WSL.
+
+    Detection methods (in order):
+    1. FREECAD_HOST environment variable (explicit override)
+    2. WSL2 mirrored networking: Use localhost (shares Windows network stack)
+    3. WSL2 NAT mode: Default gateway from ip route
+    4. WSL2 NAT mode: Parse /etc/resolv.conf for nameserver (fallback)
+    5. Fallback: localhost (native Windows or same-machine setup)
+
+    Note: WSL2 mirrored networking mode allows localhost to reach Windows services
+    directly. This is detected by checking /etc/wsl.conf or absence of WSL-specific
+    gateway routes.
+    """
+    # 1. Explicit override via environment variable
+    env_host = os.environ.get("FREECAD_HOST")
+    if env_host:
+        return env_host
+
+    # 2. Check if we're in WSL by looking for WSL-specific files
+    is_wsl = False
+    try:
+        is_wsl = os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+        if not is_wsl and os.path.exists("/proc/version"):
+            with open("/proc/version", "r") as f:
+                is_wsl = "microsoft" in f.read().lower()
+    except (PermissionError, IOError):
+        pass
+
+    if not is_wsl:
+        return "localhost"
+
+    # 3. Check for WSL2 mirrored networking mode
+    # In mirrored mode, localhost works directly to reach Windows services
+    # Detect by checking if /etc/wsl.conf has networkingMode=mirrored
+    # or by testing if localhost can reach Windows (simpler: check wsl.conf)
+    try:
+        with open("/etc/wsl.conf", "r") as f:
+            content = f.read().lower()
+            if "networkingmode" in content and "mirrored" in content:
+                return "localhost"
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # Also check Windows-side .wslconfig via environment or by testing connectivity
+    # Simpler heuristic: if no default gateway exists, assume mirrored mode
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            # Output format: "default via 192.168.x.1 dev eth0"
+            parts = result.stdout.split()
+            if "via" in parts:
+                idx = parts.index("via")
+                if idx + 1 < len(parts):
+                    gateway_ip = parts[idx + 1]
+                    if gateway_ip and not gateway_ip.startswith("127."):
+                        # Test if gateway is reachable on target port, otherwise try localhost
+                        # For now, return gateway (NAT mode)
+                        return gateway_ip
+            else:
+                # No gateway route - likely mirrored mode
+                return "localhost"
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # 4. Fallback to /etc/resolv.conf nameserver (NAT mode)
+    try:
+        with open("/etc/resolv.conf", "r") as f:
+            for line in f:
+                if line.startswith("nameserver"):
+                    ip = line.split()[1].strip()
+                    if ip and not ip.startswith("127."):
+                        return ip
+    except (FileNotFoundError, IndexError, PermissionError):
+        pass
+
+    # 5. Fallback - try localhost (works in mirrored mode)
+    return "localhost"
+
 
 # Configure logging
 logging.basicConfig(
@@ -18,8 +109,30 @@ _only_text_feedback = False
 
 
 class FreeCADConnection:
-    def __init__(self, host: str = "localhost", port: int = 9875):
+    def __init__(self, host: str | None = None, port: int = 9875):
+        """Connect to FreeCAD XML-RPC server.
+
+        Args:
+            host: FreeCAD host. If None, auto-detects Windows host when in WSL.
+                  Can be overridden with FREECAD_HOST environment variable.
+            port: FreeCAD RPC port (default 9875, can override with FREECAD_PORT env var)
+        """
+        if host is None:
+            host = get_windows_host_ip()
+
+        # Allow port override via environment
+        port = int(os.environ.get("FREECAD_PORT", port))
+
+        self.host = host
+        self.port = port
         self.server = xmlrpc.client.ServerProxy(f"http://{host}:{port}", allow_none=True)
+        logger.info(f"FreeCAD connection configured: {host}:{port}")
+
+    def disconnect(self):
+        """Cleanup connection (no-op for XML-RPC but required for interface)"""
+        logger.info(f"Disconnecting from FreeCAD at {self.host}:{self.port}")
+        # XML-RPC is stateless, no actual cleanup needed
+        pass
 
     def ping(self) -> bool:
         return self.server.ping()
@@ -122,31 +235,51 @@ _freecad_connection: FreeCADConnection | None = None
 
 
 def get_freecad_connection():
-    """Get or create a persistent FreeCAD connection"""
+    """Get or create a persistent FreeCAD connection.
+
+    Auto-detects Windows host IP when running in WSL.
+    Can be overridden with FREECAD_HOST and FREECAD_PORT environment variables.
+    """
     global _freecad_connection
     if _freecad_connection is None:
-        _freecad_connection = FreeCADConnection(host="localhost", port=9875)
-        if not _freecad_connection.ping():
-            logger.error("Failed to ping FreeCAD")
+        _freecad_connection = FreeCADConnection()  # Auto-detects host
+        try:
+            if not _freecad_connection.ping():
+                raise Exception("Ping returned False")
+        except Exception as e:
+            host = _freecad_connection.host
+            port = _freecad_connection.port
+            logger.error(f"Failed to connect to FreeCAD at {host}:{port}: {e}")
             _freecad_connection = None
             raise Exception(
-                "Failed to connect to FreeCAD. Make sure the FreeCAD addon is running."
+                f"Failed to connect to FreeCAD at {host}:{port}. "
+                f"Make sure FreeCAD is running with the MCP addon and RPC server started. "
+                f"Set FREECAD_HOST env var to override the detected host."
             )
     return _freecad_connection
 
 
 # Helper function to safely add screenshot to response
-def add_screenshot_if_available(response, screenshot):
-    """Safely add screenshot to response only if it's available"""
-    if screenshot is not None and not _only_text_feedback:
+def add_screenshot_if_available(response, screenshot, include_screenshot: bool = False):
+    """Safely add screenshot to response only if requested and available.
+
+    Args:
+        response: List of content items to append to
+        screenshot: Base64-encoded PNG screenshot data, or None if unavailable
+        include_screenshot: If False (default), skip screenshot entirely.
+                           If True, add screenshot when available.
+
+    Returns:
+        The response list (modified in place)
+    """
+    # Don't add screenshots unless explicitly requested
+    if not include_screenshot or _only_text_feedback:
+        return response
+
+    if screenshot is not None:
         response.append(ImageContent(type="image", data=screenshot, mimeType="image/png"))
-    elif not _only_text_feedback:
-        # Add an informative message that will be seen by the AI model and user
-        response.append(TextContent(
-            type="text", 
-            text="Note: Visual preview is unavailable in the current view type (such as TechDraw or Spreadsheet). "
-                 "Switch to a 3D view to see visual feedback."
-        ))
+    # Note: We no longer add "preview unavailable" message in compact mode
+    # Only show that message if explicitly requesting screenshots and they fail
     return response
 
 
@@ -194,6 +327,8 @@ def create_object(
     obj_name: str,
     analysis_name: str | None = None,
     obj_properties: dict[str, Any] = None,
+    include_screenshot: bool = False,
+    detail_level: DetailLevel = "compact",
 ) -> list[TextContent | ImageContent]:
     """Create a new object in FreeCAD.
     Object type is starts with "Part::" or "Draft::" or "PartDesign::" or "Fem::".
@@ -320,12 +455,12 @@ def create_object(
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' created successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to create object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to create object: {str(e)}")
         return [
@@ -335,7 +470,12 @@ def create_object(
 
 @mcp.tool()
 def edit_object(
-    ctx: Context, doc_name: str, obj_name: str, obj_properties: dict[str, Any]
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    obj_properties: dict[str, Any],
+    include_screenshot: bool = False,
+    detail_level: DetailLevel = "compact",
 ) -> list[TextContent | ImageContent]:
     """Edit an object in FreeCAD.
     This tool is used when the `create_object` tool cannot handle the object creation.
@@ -357,12 +497,12 @@ def edit_object(
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' edited successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to edit object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to edit object: {str(e)}")
         return [
@@ -371,7 +511,12 @@ def edit_object(
 
 
 @mcp.tool()
-def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent | ImageContent]:
+def delete_object(
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    include_screenshot: bool = False,
+) -> list[TextContent | ImageContent]:
     """Delete an object in FreeCAD.
 
     Args:
@@ -385,17 +530,17 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
     try:
         res = freecad.delete_object(doc_name, obj_name)
         screenshot = freecad.get_active_screenshot()
-        
+
         if res["success"]:
             response = [
                 TextContent(type="text", text=f"Object '{res['object_name']}' deleted successfully"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to delete object: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to delete object: {str(e)}")
         return [
@@ -404,7 +549,11 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
 
 
 @mcp.tool()
-def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
+def execute_code(
+    ctx: Context,
+    code: str,
+    include_screenshot: bool = False,
+) -> list[TextContent | ImageContent]:
     """Execute arbitrary Python code in FreeCAD.
 
     Args:
@@ -417,17 +566,17 @@ def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
     try:
         res = freecad.execute_code(code)
         screenshot = freecad.get_active_screenshot()
-        
+
         if res["success"]:
             response = [
                 TextContent(type="text", text=f"Code executed successfully: {res['message']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to execute code: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to execute code: {str(e)}")
         return [
@@ -465,7 +614,11 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
 
 
 @mcp.tool()
-def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextContent | ImageContent]:
+def insert_part_from_library(
+    ctx: Context,
+    relative_path: str,
+    include_screenshot: bool = False,
+) -> list[TextContent | ImageContent]:
     """Insert a part from the parts library addon.
 
     Args:
@@ -478,17 +631,17 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
     try:
         res = freecad.insert_part_from_library(relative_path)
         screenshot = freecad.get_active_screenshot()
-        
+
         if res["success"]:
             response = [
                 TextContent(type="text", text=f"Part inserted from library: {res['message']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to insert part from library: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to insert part from library: {str(e)}")
         return [
@@ -497,7 +650,12 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
 
 
 @mcp.tool()
-def get_objects(ctx: Context, doc_name: str) -> list[dict[str, Any]]:
+def get_objects(
+    ctx: Context,
+    doc_name: str,
+    include_screenshot: bool = False,
+    detail_level: DetailLevel = "compact",
+) -> list[TextContent | ImageContent]:
     """Get all objects in a document.
     You can use this tool to get the objects in a document to see what you can check or edit.
 
@@ -510,10 +668,12 @@ def get_objects(ctx: Context, doc_name: str) -> list[dict[str, Any]]:
     freecad = get_freecad_connection()
     try:
         screenshot = freecad.get_active_screenshot()
+        objects = freecad.get_objects(doc_name)
+        filtered_objects = filter_objects_list(objects, detail_level)
         response = [
-            TextContent(type="text", text=json.dumps(freecad.get_objects(doc_name))),
+            TextContent(type="text", text=json.dumps(filtered_objects)),
         ]
-        return add_screenshot_if_available(response, screenshot)
+        return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to get objects: {str(e)}")
         return [
@@ -522,7 +682,13 @@ def get_objects(ctx: Context, doc_name: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def get_object(ctx: Context, doc_name: str, obj_name: str) -> dict[str, Any]:
+def get_object(
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    include_screenshot: bool = False,
+    detail_level: DetailLevel = "compact",
+) -> list[TextContent | ImageContent]:
     """Get an object from a document.
     You can use this tool to get the properties of an object to see what you can check or edit.
 
@@ -536,10 +702,12 @@ def get_object(ctx: Context, doc_name: str, obj_name: str) -> dict[str, Any]:
     freecad = get_freecad_connection()
     try:
         screenshot = freecad.get_active_screenshot()
+        obj_data = freecad.get_object(doc_name, obj_name)
+        filtered_data = filter_object_properties(obj_data, detail_level)
         response = [
-            TextContent(type="text", text=json.dumps(freecad.get_object(doc_name, obj_name))),
+            TextContent(type="text", text=json.dumps(filtered_data)),
         ]
-        return add_screenshot_if_available(response, screenshot)
+        return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
         logger.error(f"Failed to get object: {str(e)}")
         return [
@@ -595,6 +763,13 @@ Only revert to basic creation methods in the following cases:
 """
 
 
+# Register process engineering contract tools
+register_contract_tools(mcp, get_freecad_connection, add_screenshot_if_available)
+
+# Register TechDraw plan sheet tools
+register_techdraw_tools(mcp, get_freecad_connection, add_screenshot_if_available)
+
+
 def main():
     """Run the MCP server"""
     global _only_text_feedback
@@ -605,3 +780,7 @@ def main():
     _only_text_feedback = args.only_text_feedback
     logger.info(f"Only text feedback: {_only_text_feedback}")
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
