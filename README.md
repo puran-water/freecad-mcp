@@ -127,6 +127,157 @@ git clone https://github.com/neka-nat/freecad-mcp.git
 * `get_object`: Get an object in a document.
 * `get_parts_list`: Get the list of parts in the [parts library](https://github.com/FreeCAD/FreeCAD-library).
 
+---
+
+## Process Engineering Extensions (puran-water fork)
+
+This fork ([puran-water/freecad-mcp](https://github.com/puran-water/freecad-mcp)) adds process engineering extensions for wastewater/biogas facility design workflows.
+
+### Architecture
+
+FreeCAD MCP serves as the **Engineering Truth** layer in the process engineering toolchain:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        SITE LAYOUT WORKFLOW                          │
+│                                                                       │
+│   site-fit MCP ──────► sitefit_export_contract()                     │
+│   (Constraint Solver)          │                                      │
+│                                ▼                                      │
+│                    FreeCAD MCP ◄──────────────────────────────────   │
+│                    (Engineering Truth)                                │
+│                         │                                             │
+│                         ├── import_sitefit_contract()                │
+│                         ├── create_equipment_envelope()              │
+│                         ├── create_techdraw_plan_sheet()             │
+│                         │                                             │
+│                         ▼                                             │
+│                    Blender MCP (Visualization)                       │
+│                         └── export_glb()                             │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                           PFD WORKFLOW                               │
+│                                                                       │
+│   engineering-mcp ──────► dexpi_export_json()                        │
+│   (SFILES/DEXPI)               │                                      │
+│                                ▼                                      │
+│                    FreeCAD MCP ◄──────────────────────────────────   │
+│                    (CAD Generation)                                   │
+│                         │                                             │
+│                         ├── execute_code() → PIDWorkbench import     │
+│                         ├── create_techdraw_plan_sheet()             │
+│                         │                                             │
+│                         ▼                                             │
+│                    PDF / DXF / SVG Drawings                          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Extended Tools
+
+#### Site Layout Tools (Contract-based)
+
+| Tool | Purpose |
+|------|---------|
+| `import_sitefit_contract` | Import complete site-fit contract (boundary, equipment, placements, roads) |
+| `export_contract_json` | Export site boundary + equipment envelopes as Spatial Contract JSON |
+| `apply_placements` | Apply solved positions from site-fit back to FreeCAD objects |
+| `create_equipment_envelope` | Create simple equipment placeholder shapes (cylinder/box) |
+| `create_site_boundary` | Create Draft Wire for site boundary polygon |
+| `present_layout_options` | Create separate documents for each layout solution for review |
+| `finalize_selected_layout` | Finalize selected layout with TechDraw output |
+
+#### TechDraw Tools
+
+| Tool | Purpose |
+|------|---------|
+| `create_techdraw_plan_sheet` | Generate 2D engineering drawing with top view and title block |
+| `export_techdraw_page` | Export TechDraw page to PDF/DXF/SVG |
+| `list_techdraw_templates` | List available TechDraw template sizes (ISO A0-A4, ANSI D/E) |
+
+### Response Optimization
+
+All tools support optional parameters to reduce context consumption:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `include_screenshot` | `False` | Include viewport screenshot in response |
+| `detail_level` | `"compact"` | `"compact"` for essential fields, `"full"` for all properties |
+
+### Workflow Integration
+
+#### Site Test Fit Workflow
+
+Used by the `site-fit-workflow` skill for facility layout optimization:
+
+```python
+# 1. Generate layouts with site-fit MCP
+result = sitefit_generate(site_boundary=..., structures=...)
+
+# 2. Export contract for FreeCAD
+contract = sitefit_export_contract(solution_id=result["solutions"][0]["id"])
+
+# 3. Import into FreeCAD
+import_sitefit_contract(doc_name="SitePlan", contract_json=contract)
+
+# 4. Generate engineering drawing
+create_techdraw_plan_sheet(
+    doc_name="SitePlan",
+    scale="1:200",
+    project_name="WWTP Layout",
+    export_pdf_path="/path/to/site_plan.pdf"
+)
+```
+
+#### PFD Workflow
+
+Used by the `pfd-skill` for Process Flow Diagram generation:
+
+```python
+# 1. Create PFD with engineering-mcp (SFILES tools)
+pfd_id = sfiles_create_flowsheet(name="Aeration PFD", type="PFD")
+# ... add equipment, streams, controls ...
+
+# 2. Export to DEXPI JSON
+dexpi_export(model_id=pfd_id, format="json", output_path="pfd.dexpi.json")
+
+# 3. Import into FreeCAD via PIDWorkbench
+execute_code("""
+from PIDWorkbench.commands.import_cmd import DexpiImporter
+DexpiImporter().import_dexpi("pfd.dexpi.json")
+""")
+
+# 4. Generate CAD drawing
+create_techdraw_plan_sheet(
+    doc_name="PFD",
+    template="ISO_A3_Landscape",
+    scale="1:50",
+    project_name="WWTP Process",
+    drawing_number="PFD-001",
+    export_pdf_path="pfd_drawing.pdf"
+)
+```
+
+### WSL + Windows Setup
+
+This fork includes WSL support for running the MCP server in WSL while FreeCAD runs on Windows. See [CLAUDE.md](./CLAUDE.md) for detailed setup instructions.
+
+### Installation (Fork)
+
+```bash
+# Clone the fork
+git clone https://github.com/puran-water/freecad-mcp.git
+cd freecad-mcp
+
+# Install addon to FreeCAD (Windows)
+./install_addon.sh
+
+# Or manually copy
+cp -r addon/FreeCADMCP "$APPDATA/FreeCAD/Mod/"
+```
+
+---
+
 ## Contributors
 
 <a href="https://github.com/neka-nat/freecad-mcp/graphs/contributors">
