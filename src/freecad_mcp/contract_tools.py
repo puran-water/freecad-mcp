@@ -457,29 +457,39 @@ if not doc:
 # Unit conversion (m to mm)
 M_TO_MM = 1000.0
 
+def find_equipment_by_id(doc, equip_id):
+    """Find equipment by EquipmentId property first (survives name collisions)."""
+    # First, try EquipmentId custom property
+    for obj in doc.Objects:
+        if getattr(obj, "EquipmentId", None) == equip_id:
+            return obj
+    # Fallback to normalized Name (FreeCAD converts hyphens to underscores)
+    normalized_id = equip_id.replace("-", "_")
+    obj = doc.getObject(normalized_id)
+    if obj:
+        return obj
+    # Fallback to Label search
+    matches = doc.getObjectsByLabel(equip_id)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
 placements = {json.dumps(placements)}
 updated = []
 errors = []
 
 for p in placements:
-    obj_id = p.get("id")
+    # Support both 'id' (contract format) and 'structure_id' (site-fit format)
+    obj_id = p.get("id") or p.get("structure_id")
+    if not obj_id:
+        errors.append("Placement missing both 'id' and 'structure_id'")
+        continue
+
     x = p.get("x", 0) * M_TO_MM  # Convert m to mm
     y = p.get("y", 0) * M_TO_MM
     rotation_deg = p.get("rotation_deg", 0)
 
-    # Try normalized Name first (FreeCAD converts hyphens to underscores)
-    normalized_id = obj_id.replace("-", "_")
-    obj = doc.getObject(normalized_id)
-
-    # Fallback: search by Label if Name lookup fails
-    if not obj:
-        matches = doc.getObjectsByLabel(obj_id)
-        if len(matches) == 1:
-            obj = matches[0]
-        elif len(matches) > 1:
-            errors.append(f"Multiple objects with label '{{obj_id}}' found")
-            continue
-
+    obj = find_equipment_by_id(doc, obj_id)
     if not obj:
         errors.append(f"Object '{{obj_id}}' not found")
         continue
@@ -487,13 +497,25 @@ for p in placements:
     # Get current Z position to preserve elevation
     current_z = obj.Placement.Base.z
 
-    # For Part::Box (rectangular equipment), offset by half dimensions
+    # For Part::Box (rectangular equipment), calculate corner position after rotation
     # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER
+    # We must rotate the corner offset so the CENTER ends up at (x, y)
     if obj.TypeId == "Part::Box":
         half_length = obj.Length / 2
         half_width = obj.Width / 2
-        corner_x = x - half_length
-        corner_y = y - half_width
+
+        # Rotate corner offset around center
+        theta = math.radians(rotation_deg)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        # Offset from center to corner (before rotation): (-half_length, -half_width)
+        # After rotation: apply 2D rotation matrix
+        rotated_offset_x = -half_length * cos_t + half_width * sin_t
+        rotated_offset_y = -half_length * sin_t - half_width * cos_t
+
+        corner_x = x + rotated_offset_x
+        corner_y = y + rotated_offset_y
         new_pos = FreeCAD.Vector(corner_x, corner_y, current_z)
     else:
         # Cylinders and other shapes are already centered
@@ -1074,6 +1096,7 @@ print(f"Created boundary '{{wire.Label}}' with {{len(vectors)}} points")
         create_equipment: bool = True,
         apply_placements_flag: bool = True,
         road_layer_name: str = "RoadCenterlines",
+        strict: bool = False,
         include_screenshot: bool = False,
         detail_level: DetailLevel = "compact",
     ) -> list[TextContent | ImageContent]:
@@ -1091,6 +1114,7 @@ print(f"Created boundary '{{wire.Label}}' with {{len(vectors)}} points")
             create_equipment: Create equipment envelopes (default: True)
             apply_placements_flag: Apply solved placements to equipment (default: True)
             road_layer_name: Group name for road centerlines (default: "RoadCenterlines")
+            strict: Fail immediately on first equipment creation error (default: False)
 
         Returns:
             Summary of imported components
@@ -1197,26 +1221,44 @@ import FreeCAD
 import Part
 
 doc = FreeCAD.getDocument("{doc_name}")
-existing = doc.getObject("{struct_id}")
+
+# Check for existing equipment by EquipmentId property first, then by Name
+existing = None
+for obj in doc.Objects:
+    if getattr(obj, "EquipmentId", None) == "{struct_id}":
+        existing = obj
+        break
+if not existing:
+    existing = doc.getObject("{struct_id}")
+
 if existing:
-    print("EQUIP_STATUS:exists:{struct_id}")
+    print("EQUIP_STATUS:exists:{struct_id}:" + existing.Name)
 else:
     cylinder = doc.addObject("Part::Cylinder", "{struct_id}")
-    # Verify the name wasn't auto-renamed (collision detection)
-    if cylinder.Name != "{struct_id}":
-        doc.removeObject(cylinder.Name)
-        print("EQUIP_STATUS:collision:{struct_id}")
+    # Accept the object regardless of auto-rename (FreeCAD adds suffix on collision)
+    actual_name = cylinder.Name
+    cylinder.Radius = {radius_mm}
+    cylinder.Height = {height_mm}
+    cylinder.Label = "{struct_id}"  # Display name
+
+    # Add EquipmentId for stable lookup (survives name collisions)
+    try:
+        cylinder.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
+    except Exception:
+        pass  # Property may already exist
+    cylinder.EquipmentId = "{struct_id}"
+
+    try:
+        cylinder.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
+    except Exception:
+        pass  # Property may already exist
+    cylinder.EquipmentType = "{struct_type}"
+    doc.recompute()
+
+    if actual_name != "{struct_id}":
+        print("EQUIP_STATUS:created_renamed:{struct_id}:" + actual_name)
     else:
-        cylinder.Radius = {radius_mm}
-        cylinder.Height = {height_mm}
-        cylinder.Label = "{struct_id}"
-        try:
-            cylinder.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
-        except Exception:
-            pass  # Property may already exist
-        cylinder.EquipmentType = "{struct_type}"
-        doc.recompute()
-        print("EQUIP_STATUS:created:{struct_id}")
+        print("EQUIP_STATUS:created:{struct_id}:" + actual_name)
 '''
                     else:  # rectangle
                         width = footprint.get("w", 10.0)
@@ -1230,71 +1272,138 @@ import FreeCAD
 import Part
 
 doc = FreeCAD.getDocument("{doc_name}")
-existing = doc.getObject("{struct_id}")
+
+# Check for existing equipment by EquipmentId property first, then by Name
+existing = None
+for obj in doc.Objects:
+    if getattr(obj, "EquipmentId", None) == "{struct_id}":
+        existing = obj
+        break
+if not existing:
+    existing = doc.getObject("{struct_id}")
+
 if existing:
-    print("EQUIP_STATUS:exists:{struct_id}")
+    print("EQUIP_STATUS:exists:{struct_id}:" + existing.Name)
 else:
     box = doc.addObject("Part::Box", "{struct_id}")
-    # Verify the name wasn't auto-renamed (collision detection)
-    if box.Name != "{struct_id}":
-        doc.removeObject(box.Name)
-        print("EQUIP_STATUS:collision:{struct_id}")
+    # Accept the object regardless of auto-rename (FreeCAD adds suffix on collision)
+    actual_name = box.Name
+    box.Width = {width_mm}
+    box.Length = {length_mm}
+    box.Height = {height_mm}
+    box.Label = "{struct_id}"  # Display name
+    box.Placement.Base.x = -{width_mm / 2}
+    box.Placement.Base.y = -{length_mm / 2}
+
+    # Add EquipmentId for stable lookup (survives name collisions)
+    try:
+        box.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
+    except Exception:
+        pass  # Property may already exist
+    box.EquipmentId = "{struct_id}"
+
+    try:
+        box.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
+    except Exception:
+        pass  # Property may already exist
+    box.EquipmentType = "{struct_type}"
+    doc.recompute()
+
+    if actual_name != "{struct_id}":
+        print("EQUIP_STATUS:created_renamed:{struct_id}:" + actual_name)
     else:
-        box.Width = {width_mm}
-        box.Length = {length_mm}
-        box.Height = {height_mm}
-        box.Label = "{struct_id}"
-        box.Placement.Base.x = -{width_mm / 2}
-        box.Placement.Base.y = -{length_mm / 2}
-        try:
-            box.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
-        except Exception:
-            pass  # Property may already exist
-        box.EquipmentType = "{struct_type}"
-        doc.recompute()
-        print("EQUIP_STATUS:created:{struct_id}")
+        print("EQUIP_STATUS:created:{struct_id}:" + actual_name)
 '''
 
                     res = freecad.execute_code(equip_code)
                     msg = res.get("message", "")
                     if "EQUIP_STATUS:created" in msg or "EQUIP_STATUS:exists" in msg:
                         results["equipment"] += 1
-                    elif "EQUIP_STATUS:collision" in msg:
-                        results["errors"].append(f"Name collision for {struct_id} - object with similar name exists")
+                        # Log if object was auto-renamed
+                        if "created_renamed" in msg:
+                            logger.info(f"Equipment {struct_id} was auto-renamed by FreeCAD due to name collision")
                     else:
                         error_detail = res.get("error", msg or "Unknown error")
                         results["errors"].append(f"Failed to create {struct_id}: {error_detail}")
                         logger.error(f"Equipment creation failed for {struct_id}: {error_detail}")
 
+                        # Fail fast in strict mode
+                        if strict:
+                            return [TextContent(
+                                type="text",
+                                text=f"Equipment creation failed (strict mode):\n"
+                                     f"  Failed: {struct_id}\n"
+                                     f"  Error: {error_detail}\n"
+                                     f"  Created: {results['equipment']} of {len(structures)}\n"
+                                     f"Use strict=False to continue on errors."
+                            )]
+
             # 4. Apply placements if requested
             if apply_placements_flag and placements_data:
                 placement_code = f'''
 import FreeCAD
+import math
 
 doc = FreeCAD.getDocument("{doc_name}")
 M_TO_MM = 1000.0
 placements = {json.dumps(placements_data)}
 updated = 0
+not_found = []
+
+def find_equipment_by_id(doc, equip_id):
+    """Find equipment by EquipmentId property (survives name collisions)."""
+    # First, try to find by EquipmentId custom property
+    for obj in doc.Objects:
+        if getattr(obj, "EquipmentId", None) == equip_id:
+            return obj
+    # Fallback to normalized Name (FreeCAD converts hyphens to underscores)
+    normalized_id = equip_id.replace("-", "_")
+    obj = doc.getObject(normalized_id)
+    if obj:
+        return obj
+    # Fallback to Label search
+    matches = doc.getObjectsByLabel(equip_id)
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 for p in placements:
-    obj_id = p.get("id")
+    # Support both 'id' (contract format) and 'structure_id' (site-fit format)
+    obj_id = p.get("id") or p.get("structure_id")
+    if not obj_id:
+        not_found.append("missing_id")
+        continue
+
     x = p.get("x", 0) * M_TO_MM
     y = p.get("y", 0) * M_TO_MM
     rotation_deg = p.get("rotation_deg", 0)
 
-    obj = doc.getObject(obj_id)
+    obj = find_equipment_by_id(doc, obj_id)
     if not obj:
+        not_found.append(obj_id)
         continue
 
     current_z = obj.Placement.Base.z
 
-    # For Part::Box (rectangular equipment), offset by half dimensions
+    # For Part::Box (rectangular equipment), calculate corner position after rotation
     # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER
+    # We must rotate the corner offset so the CENTER ends up at (x, y)
     if obj.TypeId == "Part::Box":
         half_length = obj.Length / 2
         half_width = obj.Width / 2
-        corner_x = x - half_length
-        corner_y = y - half_width
+
+        # Rotate corner offset around center
+        theta = math.radians(rotation_deg)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        # Offset from center to corner (before rotation): (-half_length, -half_width)
+        # After rotation: apply 2D rotation matrix
+        rotated_offset_x = -half_length * cos_t + half_width * sin_t
+        rotated_offset_y = -half_length * sin_t - half_width * cos_t
+
+        corner_x = x + rotated_offset_x
+        corner_y = y + rotated_offset_y
         new_pos = FreeCAD.Vector(corner_x, corner_y, current_z)
     else:
         # Cylinders and other shapes are already centered
@@ -1305,14 +1414,26 @@ for p in placements:
     updated += 1
 
 doc.recompute()
-print(f"placements_{{updated}}")
+if not_found:
+    print(f"placements_{{updated}}_missing_" + ",".join(not_found))
+else:
+    print(f"placements_{{updated}}")
 '''
                 res = freecad.execute_code(placement_code)
                 msg = res.get("message", "")
                 if "placements_" in msg:
                     try:
-                        count = int(msg.split("placements_")[1].split()[0])
+                        parts = msg.split("placements_")[1]
+                        count = int(parts.split("_")[0].split()[0])
                         results["placements"] = count
+
+                        # Check for missing equipment
+                        if "_missing_" in msg:
+                            missing = msg.split("_missing_")[1].strip()
+                            if missing:
+                                results["errors"].append(f"Placements skipped for missing equipment: {missing}")
+                                if strict:
+                                    logger.warning(f"Strict mode: {len(missing.split(','))} equipment not found for placement")
                     except (ValueError, IndexError):
                         pass
 
@@ -1505,10 +1626,14 @@ print("boundary_ok")
                 height = struct.get("height", 5.0)
                 height_mm = height * M_TO_MM
 
-                # Find placement for this structure
-                placement = next((p for p in placements if p.get("structure_id") == struct_id), None)
+                # Find placement for this structure (support both id formats)
+                placement = next(
+                    (p for p in placements if p.get("structure_id") == struct_id or p.get("id") == struct_id),
+                    None
+                )
                 x_m = placement.get("x", 0) if placement else 0
                 y_m = placement.get("y", 0) if placement else 0
+                rotation_deg = placement.get("rotation_deg", 0) if placement else 0
                 x_mm = x_m * M_TO_MM
                 y_mm = y_m * M_TO_MM
 
@@ -1524,21 +1649,33 @@ cyl = doc.addObject("Part::Cylinder", "{struct_id}")
 cyl.Radius = {radius_mm}
 cyl.Height = {height_mm}
 cyl.Label = "{struct_id}"
-cyl.Placement.Base.x = {x_mm}
-cyl.Placement.Base.y = {y_mm}
+# Apply position and rotation
+rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), {rotation_deg})
+cyl.Placement = FreeCAD.Placement(FreeCAD.Vector({x_mm}, {y_mm}, 0), rotation)
 cyl.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
 cyl.EquipmentType = "{struct_type}"
+cyl.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
+cyl.EquipmentId = "{struct_id}"
 doc.recompute()
 print("equip_ok")
 '''
                 else:  # rectangle
+                    import math
                     width = footprint.get("w", 10.0)
                     length = footprint.get("h", 10.0)
                     width_mm = width * M_TO_MM
                     length_mm = length * M_TO_MM
-                    # Calculate corner from center
-                    corner_x_mm = x_mm - width_mm / 2
-                    corner_y_mm = y_mm - length_mm / 2
+                    # Calculate corner from center with rotation
+                    # Rotate corner offset so center ends up at (x_mm, y_mm)
+                    theta = math.radians(rotation_deg)
+                    cos_t = math.cos(theta)
+                    sin_t = math.sin(theta)
+                    half_w = width_mm / 2
+                    half_l = length_mm / 2
+                    rotated_offset_x = -half_w * cos_t + half_l * sin_t
+                    rotated_offset_y = -half_w * sin_t - half_l * cos_t
+                    corner_x_mm = x_mm + rotated_offset_x
+                    corner_y_mm = y_mm + rotated_offset_y
                     equip_code = f'''
 import FreeCAD
 import Part
@@ -1549,10 +1686,13 @@ box.Length = {width_mm}
 box.Width = {length_mm}
 box.Height = {height_mm}
 box.Label = "{struct_id}"
-box.Placement.Base.x = {corner_x_mm}
-box.Placement.Base.y = {corner_y_mm}
+# Apply position with rotated corner offset and rotation
+rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), {rotation_deg})
+box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x_mm}, {corner_y_mm}, 0), rotation)
 box.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
 box.EquipmentType = "{struct_type}"
+box.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
+box.EquipmentId = "{struct_id}"
 doc.recompute()
 print("equip_ok")
 '''

@@ -249,21 +249,47 @@ else:
     except Exception as e:
         print(f"Warning: Could not set title block fields: {{e}}")
 
-# Collect visible objects with shapes for the view
-source_objects = []
-for obj in doc.Objects:
-    # Skip TechDraw objects, templates, and invisible objects
-    if obj.TypeId.startswith("TechDraw::"):
-        continue
-    if hasattr(obj, "ViewObject") and hasattr(obj.ViewObject, "Visibility"):
-        if not obj.ViewObject.Visibility:
+# Collect visible objects with shapes for the view (including compound sub-objects)
+def collect_objects_with_shapes(objects, collected=None):
+    """Recursively collect objects with shapes, including compound sub-objects."""
+    if collected is None:
+        collected = []
+    for obj in objects:
+        # Skip TechDraw objects, templates, and invisible objects
+        if obj.TypeId.startswith("TechDraw::"):
             continue
-    # Check if object has a Shape (Part objects, Draft Wires, etc.)
-    if hasattr(obj, "Shape") and obj.Shape:
-        source_objects.append(obj)
+        if hasattr(obj, "ViewObject") and hasattr(obj.ViewObject, "Visibility"):
+            if not obj.ViewObject.Visibility:
+                continue
+        # Check if object has a Shape
+        if hasattr(obj, "Shape") and obj.Shape:
+            collected.append(obj)
+            # For compounds, also check linked objects
+            if hasattr(obj, "Links"):
+                collect_objects_with_shapes(obj.Links, collected)
+            if hasattr(obj, "OutList"):
+                for child in obj.OutList:
+                    if child not in collected and hasattr(child, "Shape") and child.Shape:
+                        collected.append(child)
+    return collected
+
+source_objects = collect_objects_with_shapes(doc.Objects)
 
 if not source_objects:
     raise ValueError("No visible objects with shapes found in document")
+
+# Calculate model bounds for proper view positioning
+all_bounds = [o.Shape.BoundBox for o in source_objects if hasattr(o, "Shape") and o.Shape]
+if all_bounds:
+    model_min_x = min(b.XMin for b in all_bounds)
+    model_max_x = max(b.XMax for b in all_bounds)
+    model_min_y = min(b.YMin for b in all_bounds)
+    model_max_y = max(b.YMax for b in all_bounds)
+    model_width = model_max_x - model_min_x
+    model_height = model_max_y - model_min_y
+else:
+    model_width = 1000  # Fallback
+    model_height = 1000
 
 # Create top view (looking down Z axis)
 view = doc.addObject("TechDraw::DrawViewPart", "{view_name}")
@@ -271,21 +297,38 @@ view.Source = source_objects
 view.Direction = FreeCAD.Vector(0, 0, -1)  # Top view (looking down)
 view.XDirection = FreeCAD.Vector(1, 0, 0)  # X points right
 
-# Set scale
-view.ScaleType = "Custom"
-view.Scale = {scale_value}
-
-# Add view to page
-page.addView(view)
-
-# Center the view on the page
 # Get page size from template
 page_width = page.Template.Width.Value if hasattr(page, "Template") and page.Template else {TEMPLATE_SIZES[template]["width"]}
 page_height = page.Template.Height.Value if hasattr(page, "Template") and page.Template else {TEMPLATE_SIZES[template]["height"]}
 
-# Position view in center of drawing area (accounting for title block margin ~50mm on right/bottom)
-view.X = (page_width - 50) / 2
-view.Y = (page_height - 50) / 2
+# Calculate drawing area (accounting for title block margin ~50mm on right/bottom, ~10mm on left/top)
+drawing_area_width = page_width - 60  # 10mm left + 50mm right margin
+drawing_area_height = page_height - 60  # 10mm top + 50mm bottom margin
+drawing_center_x = 10 + drawing_area_width / 2  # Offset from left margin
+drawing_center_y = 50 + drawing_area_height / 2  # Offset from bottom margin
+
+# Calculate auto-scale to fit model in drawing area (with 10% margin for labels)
+requested_scale = {scale_value}
+fit_scale_x = (drawing_area_width * 0.9) / model_width if model_width > 0 else requested_scale
+fit_scale_y = (drawing_area_height * 0.9) / model_height if model_height > 0 else requested_scale
+auto_fit_scale = min(fit_scale_x, fit_scale_y)
+
+# Use requested scale if it fits, otherwise use auto-fit
+if requested_scale <= auto_fit_scale:
+    final_scale = requested_scale
+else:
+    final_scale = auto_fit_scale
+    print(f"Warning: Requested scale {{requested_scale}} too large, using auto-fit scale {{auto_fit_scale:.6f}}")
+
+view.ScaleType = "Custom"
+view.Scale = final_scale
+
+# Add view to page
+page.addView(view)
+
+# Center the view on the drawing area
+view.X = drawing_center_x
+view.Y = drawing_center_y
 
 # Recompute to update view
 doc.recompute()
@@ -297,25 +340,42 @@ labels_added = 0
         if include_labels:
             code += '''
 # Add labels for equipment using DrawViewBalloon with leader lines
+# Uses zone-based label placement with collision avoidance
 import math
 
 try:
-    # First calculate model center (which is what the view is centered on)
-    all_bounds = [o.Shape.BoundBox for o in source_objects if hasattr(o, "Shape") and o.Shape]
-    if all_bounds:
-        model_min_x = min(b.XMin for b in all_bounds)
-        model_max_x = max(b.XMax for b in all_bounds)
-        model_min_y = min(b.YMin for b in all_bounds)
-        model_max_y = max(b.YMax for b in all_bounds)
-        model_center_x = (model_min_x + model_max_x) / 2
-        model_center_y = (model_min_y + model_max_y) / 2
-    else:
-        model_center_x = 0.0
-        model_center_y = 0.0
+    # Model bounds already calculated above
+    model_center_x = (model_min_x + model_max_x) / 2
+    model_center_y = (model_min_y + model_max_y) / 2
 
     view_x = float(view.X)
     view_y = float(view.Y)
     view_scale = float(view.Scale)
+
+    # Define label zones around page margins (for professional leader line routing)
+    # Zones: left, right, top, bottom strips for label placement
+    zone_margin = 40.0  # Distance from page edge for label zones
+    zone_width = 60.0   # Width of label zones
+    min_label_spacing = 12.0  # Minimum vertical/horizontal spacing between labels
+
+    # Calculate view bounds on page
+    scaled_model_width = model_width * view_scale
+    scaled_model_height = model_height * view_scale
+    view_left = view_x - scaled_model_width / 2
+    view_right = view_x + scaled_model_width / 2
+    view_bottom = view_y - scaled_model_height / 2
+    view_top = view_y + scaled_model_height / 2
+
+    # Label zones (x_min, x_max, y_min, y_max) for each side
+    zones = {
+        "left": (zone_margin, zone_margin + zone_width, view_bottom, view_top),
+        "right": (page_width - zone_margin - zone_width, page_width - zone_margin, view_bottom, view_top),
+        "top": (view_left, view_right, page_height - zone_margin - zone_width, page_height - zone_margin),
+        "bottom": (view_left, view_right, zone_margin, zone_margin + zone_width),
+    }
+
+    # Track occupied label positions per zone for collision avoidance
+    occupied = {"left": [], "right": [], "top": [], "bottom": []}
 
     # Check if DrawViewBalloon is available
     use_balloons = True
@@ -325,7 +385,16 @@ try:
     except Exception:
         use_balloons = False
 
-    for i, obj in enumerate(source_objects):
+    # Collect equipment objects (skip boundary wires, groups, etc.)
+    equipment_objects = []
+    for obj in source_objects:
+        # Filter to only equipment (cylinders, boxes with EquipmentId or EquipmentType)
+        has_equip_prop = hasattr(obj, "EquipmentId") or hasattr(obj, "EquipmentType")
+        is_part = obj.TypeId in ("Part::Cylinder", "Part::Box", "Part::Feature")
+        if has_equip_prop or (is_part and not obj.Name.startswith("SiteBoundary")):
+            equipment_objects.append(obj)
+
+    for i, obj in enumerate(equipment_objects):
         # Create balloon/annotation for equipment ID
         obj_name = obj.Label if hasattr(obj, "Label") else obj.Name
 
@@ -343,15 +412,48 @@ try:
             origin_x = view_x + (offset_x * view_scale)
             origin_y = view_y + (offset_y * view_scale)
 
-            # Balloon bubble position - spread in fan pattern with page bounds clamping
-            angle = math.radians(60 + (i * 25) % 120)  # Spread 60-180 degrees (upper half)
-            label_distance = 20.0  # mm from object center
+            # Determine best zone based on object position relative to model center
+            # Route leader lines away from model center for clarity
+            dx = offset_x
+            dy = offset_y
 
-            bubble_x = origin_x + label_distance * math.cos(angle)
-            bubble_y = origin_y + label_distance * math.sin(angle)
+            # Choose zone opposite to object position (labels point outward)
+            if abs(dx) > abs(dy):
+                # Object is more horizontal - use left/right zones
+                zone_name = "right" if dx < 0 else "left"
+            else:
+                # Object is more vertical - use top/bottom zones
+                zone_name = "top" if dy < 0 else "bottom"
 
-            # Clamp to page bounds (with margins)
-            margin = 15.0  # mm from edge
+            # Get zone bounds
+            z = zones[zone_name]
+
+            # Find non-overlapping position in zone
+            if zone_name in ("left", "right"):
+                # Vertical arrangement
+                bubble_x = (z[0] + z[1]) / 2
+                # Start at object's Y position, then adjust for collisions
+                target_y = origin_y
+                for oy in occupied[zone_name]:
+                    if abs(target_y - oy) < min_label_spacing:
+                        target_y = oy + min_label_spacing
+                target_y = max(z[2] + 5, min(target_y, z[3] - 5))
+                bubble_y = target_y
+                occupied[zone_name].append(bubble_y)
+            else:
+                # Horizontal arrangement
+                bubble_y = (z[2] + z[3]) / 2
+                # Start at object's X position, then adjust for collisions
+                target_x = origin_x
+                for ox in occupied[zone_name]:
+                    if abs(target_x - ox) < min_label_spacing:
+                        target_x = ox + min_label_spacing
+                target_x = max(z[0] + 5, min(target_x, z[1] - 5))
+                bubble_x = target_x
+                occupied[zone_name].append(bubble_x)
+
+            # Clamp to page bounds (safety)
+            margin = 10.0
             bubble_x = max(margin, min(bubble_x, page_width - margin))
             bubble_y = max(margin, min(bubble_y, page_height - margin))
 
