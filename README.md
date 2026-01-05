@@ -258,6 +258,60 @@ create_techdraw_plan_sheet(
 )
 ```
 
+#### CSA Workflow
+
+Used by the `csa-diagram-skill` for Control System Architecture diagrams:
+
+```python
+# 1. Import CSA topology from YAML
+import_csa_topology(
+    doc_name="WWTP_CSA",
+    topology_yaml="""
+    metadata:
+      project_name: "WWTP Control System"
+    zones:
+      - id: level_1
+        purdue_level: 1
+    controllers:
+      - id: PLC-101
+        type: PLC
+        zone: level_1
+    devices:
+      - id: RIO-101
+        type: RemoteIO
+        parent_controller: PLC-101
+    links:
+      - source: PLC-101
+        target: RIO-101
+        protocol: Ethernet_IP
+    """,
+    layout_algorithm="networkx_hierarchical"
+)
+
+# 2. Generate TechDraw sheet with PDF
+create_csa_techdraw_sheet(
+    doc_name="WWTP_CSA",
+    title="Control System Architecture",
+    sheet_number="CSA-001",
+    revision="A",
+    export_pdf_path="/path/to/csa_drawing.pdf"
+)
+```
+
+#### CSA Tools
+
+| Tool | Purpose |
+|------|---------|
+| `import_csa_topology` | Import YAML topology and create CSA objects |
+| `export_csa_topology` | Export CSA diagram to YAML/JSON |
+| `add_csa_controller` | Add a PLC/DCS/PAC controller |
+| `add_csa_device` | Add a device (RIO, HMI, SCADA, etc.) |
+| `add_csa_link` | Add a network link between components |
+| `run_csa_layout` | Run layout algorithm on CSA diagram |
+| `create_csa_techdraw_sheet` | Generate TechDraw PDF output |
+
+Requires CSAWorkbench addon: [puran-water/freecad-csa-workbench](https://github.com/puran-water/freecad-csa-workbench)
+
 ### WSL + Windows Setup
 
 This fork includes WSL support for running the MCP server in WSL while FreeCAD runs on Windows. See [CLAUDE.md](./CLAUDE.md) for detailed setup instructions.

@@ -31,6 +31,25 @@ MM_TO_M = 0.001
 M_TO_MM = 1000.0
 
 
+def get_rect_dims_at_rotation(w: float, h: float, rotation_deg: int) -> tuple[float, float]:
+    """Get rectangle dimensions adjusted for rotation.
+
+    Site-fit solver uses rotation to swap the axis-aligned bounding box.
+    For rotation 90 or 270, width and height are swapped.
+
+    Args:
+        w: Original width (X-dimension at rotation=0)
+        h: Original height (Y-dimension at rotation=0)
+        rotation_deg: Rotation in degrees (0, 90, 180, 270)
+
+    Returns:
+        Tuple of (effective_width, effective_height) for FreeCAD Part::Box
+    """
+    if rotation_deg in (90, 270):
+        return h, w
+    return w, h
+
+
 def _extract_json_from_output(output: str) -> dict | None:
     """Extract a JSON object from FreeCAD command output.
 
@@ -497,34 +516,26 @@ for p in placements:
     # Get current Z position to preserve elevation
     current_z = obj.Placement.Base.z
 
-    # For Part::Box (rectangular equipment), calculate corner position after rotation
-    # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER
-    # We must rotate the corner offset so the CENTER ends up at (x, y)
+    # For Part::Box (rectangular equipment), dimensions are pre-swapped during creation
+    # based on rotation_deg, so we use simple center-to-corner offset (no FreeCAD rotation)
+    # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER as origin
     if obj.TypeId == "Part::Box":
-        half_length = obj.Length / 2
-        half_width = obj.Width / 2
+        # FreeCAD Part::Box dimensions: Width=X, Length=Y, Height=Z
+        # These are already swapped for 90/270 rotation during equipment creation
+        half_x = obj.Width.Value / 2.0
+        half_y = obj.Length.Value / 2.0
 
-        # Rotate corner offset around center
-        theta = math.radians(rotation_deg)
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
+        # Simple center-to-corner offset (no rotation - dimensions pre-swapped)
+        new_pos = FreeCAD.Vector(x - half_x, y - half_y, current_z)
 
-        # Offset from center to corner (before rotation): (-half_length, -half_width)
-        # After rotation: apply 2D rotation matrix
-        rotated_offset_x = -half_length * cos_t + half_width * sin_t
-        rotated_offset_y = -half_length * sin_t - half_width * cos_t
-
-        corner_x = x + rotated_offset_x
-        corner_y = y + rotated_offset_y
-        new_pos = FreeCAD.Vector(corner_x, corner_y, current_z)
+        # No rotation needed - dimensions are pre-swapped based on rotation_deg
+        obj.Placement = FreeCAD.Placement(new_pos, FreeCAD.Rotation())
     else:
         # Cylinders and other shapes are already centered
+        # Apply rotation for non-rectangular shapes (though circles don't care about rotation)
+        rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), rotation_deg)
         new_pos = FreeCAD.Vector(x, y, current_z)
-
-    # Create rotation around Z axis
-    rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), rotation_deg)
-
-    obj.Placement = FreeCAD.Placement(new_pos, rotation)
+        obj.Placement = FreeCAD.Placement(new_pos, rotation)
     updated.append(obj_id)
 
 doc.recompute()
@@ -724,6 +735,7 @@ print(f"Faces: {{combined.CountFacets}}")
         length: float | None = None,
         diameter: float | None = None,
         height: float = 5.0,
+        rotation_deg: int = 0,
         include_screenshot: bool = False,
         detail_level: DetailLevel = "compact",
     ) -> list[TextContent | ImageContent]:
@@ -741,6 +753,7 @@ print(f"Faces: {{combined.CountFacets}}")
             length: Length in meters (for rectangle)
             diameter: Diameter in meters (for circle)
             height: Height in meters
+            rotation_deg: Rotation in degrees (0, 90, 180, 270) - swaps width/length for 90/270
 
         Returns:
             Success message with object details
@@ -797,7 +810,7 @@ print(f"Faces: {{combined.CountFacets}}")
                     # Dome height ratio: 6m cover / 40m diameter = 0.15
                     DOME_RATIO = 0.15
                     dome_height_mm = diameter * DOME_RATIO * M_TO_MM
-                    tank_height_mm = height_mm - dome_height_mm  # Tank wall height
+                    tank_height_mm = height_mm  # height parameter IS the shell height; dome added on top
 
                     create_code = f'''
 import FreeCAD
@@ -814,22 +827,19 @@ tank.Radius = {radius_mm}
 tank.Height = {tank_height_mm}
 tank.Label = "{equipment_id}_tank"
 
-# Create dome cover (hemisphere scaled to correct height)
-# Use a sphere with only upper half, then scale Z
-dome = doc.addObject("Part::Sphere", "{equipment_id}_dome")
-dome.Radius = {radius_mm}
-dome.Angle1 = 0    # Start at equator
-dome.Angle2 = 90   # End at top (upper hemisphere only)
-dome.Angle3 = 360  # Full rotation
+# Create dome cover using Part::Ellipsoid (flattened hemisphere)
+# Radius1 = Z height, Radius2 = X radius, Radius3 = Y radius
+dome = doc.addObject("Part::Ellipsoid", "{equipment_id}_dome")
+dome.Radius1 = {dome_height_mm}  # Z-direction (dome height)
+dome.Radius2 = {radius_mm}       # X-direction (horizontal radius)
+dome.Radius3 = {radius_mm}       # Y-direction (horizontal radius)
+dome.Angle1 = 0                  # Start at equator
+dome.Angle2 = 90                 # End at top (hemisphere)
+dome.Angle3 = 360                # Full rotation
+dome.Label = "{equipment_id}_dome"
 
 # Position dome on top of tank
 dome.Placement.Base.z = {tank_height_mm}
-
-# Scale dome to correct height ratio
-# The hemisphere's natural height is radius, we want dome_height
-scale_z = {dome_height_mm} / {radius_mm}
-dome.Placement.Matrix.scale(1, 1, scale_z)
-dome.Label = "{equipment_id}_dome"
 
 # Create compound to group them
 compound = doc.addObject("Part::Compound", "{equipment_id}")
@@ -881,8 +891,15 @@ print(f"Created {{cylinder.Name}} ({{cylinder.Label}})")
             elif shape == "rectangle":
                 if not width or not length:
                     return [TextContent(type="text", text="width and length are required for rectangle shape")]
-                width_mm = width * M_TO_MM
-                length_mm = length * M_TO_MM
+
+                # Pre-swap dimensions for 90/270 rotation (no FreeCAD rotation needed)
+                if rotation_deg in (90, 270):
+                    eff_width, eff_length = length, width
+                else:
+                    eff_width, eff_length = width, length
+
+                width_mm = eff_width * M_TO_MM
+                length_mm = eff_length * M_TO_MM
 
                 # Check if this is a building type that needs a roof
                 is_building = equipment_type.lower() in building_types
@@ -903,8 +920,8 @@ if not doc:
 
 # Create walls (main building body)
 walls = doc.addObject("Part::Box", "{equipment_id}_walls")
-walls.Length = {width_mm}
-walls.Width = {length_mm}
+walls.Width = {width_mm}    # X dimension (matches contract w)
+walls.Length = {length_mm}  # Y dimension (matches contract h)
 walls.Height = {wall_height_mm}
 walls.Label = "{equipment_id}_walls"
 
@@ -914,8 +931,8 @@ walls.Placement.Base.y = -{length_mm / 2}
 
 # Create flat roof slab with overhang
 roof = doc.addObject("Part::Box", "{equipment_id}_roof")
-roof.Length = {width_mm} + 2 * {OVERHANG_MM}
-roof.Width = {length_mm} + 2 * {OVERHANG_MM}
+roof.Width = {width_mm} + 2 * {OVERHANG_MM}    # X dimension
+roof.Length = {length_mm} + 2 * {OVERHANG_MM}  # Y dimension
 roof.Height = {ROOF_THICKNESS_MM}
 roof.Label = "{equipment_id}_roof"
 
@@ -955,8 +972,8 @@ if not doc:
 
 # Create box for rectangular equipment
 box = doc.addObject("Part::Box", "{equipment_id}")
-box.Length = {width_mm}
-box.Width = {length_mm}
+box.Width = {width_mm}    # X dimension (matches contract w)
+box.Length = {length_mm}  # Y dimension (matches contract h)
 box.Height = {height_mm}
 box.Label = "{equipment_id}"
 
@@ -1203,12 +1220,18 @@ print("boundary_ok")
                     results["boundary"] = 1
 
             # 3. Create equipment envelopes if requested
+            # Digester types that get dome covers (same list as create_equipment_envelope)
+            digester_types = ["digester", "anaerobic_digester", "reactor", "cstr",
+                              "uasb", "egsb", "ic_reactor", "membrane_bioreactor"]
+            DOME_RATIO = 0.15  # Fallback: 6m cover / 40m diameter
+
             if create_equipment and structures:
                 for struct in structures:
                     struct_id = struct.get("id", "")
                     struct_type = struct.get("type", "unknown")
                     footprint = struct.get("footprint", {})
                     struct_height = struct.get("height", 5.0)
+                    dome_height_m = struct.get("dome_height_m")  # May be None
                     shape_type = footprint.get("shape", "rect")
 
                     if shape_type == "circle":
@@ -1216,7 +1239,80 @@ print("boundary_ok")
                         radius_mm = (diameter / 2) * M_TO_MM
                         height_mm = struct_height * M_TO_MM
 
-                        equip_code = f'''
+                        # Check if this is a digester type that needs a dome cover
+                        is_digester = struct_type.lower() in digester_types
+
+                        if is_digester:
+                            # Determine dome height: prefer explicit, fallback to ratio
+                            if dome_height_m is not None:
+                                dome_height_mm = dome_height_m * M_TO_MM
+                            else:
+                                dome_height_mm = diameter * DOME_RATIO * M_TO_MM
+
+                            tank_height_mm = height_mm  # height parameter IS the shell height; dome added on top
+
+                            equip_code = f'''
+import FreeCAD
+import Part
+
+doc = FreeCAD.getDocument("{doc_name}")
+
+# Check for existing equipment by EquipmentId property first, then by Name
+existing = None
+for obj in doc.Objects:
+    if getattr(obj, "EquipmentId", None) == "{struct_id}":
+        existing = obj
+        break
+if not existing:
+    existing = doc.getObject("{struct_id}")
+
+if existing:
+    print("EQUIP_STATUS:exists:{struct_id}:" + existing.Name)
+else:
+    # Create tank body (cylinder)
+    tank = doc.addObject("Part::Cylinder", "{struct_id}_tank")
+    tank.Radius = {radius_mm}
+    tank.Height = {tank_height_mm}
+    tank.Label = "{struct_id}_tank"
+
+    # Create dome cover using Part::Ellipsoid (flattened hemisphere)
+    # Radius1 = Z height, Radius2 = X radius, Radius3 = Y radius
+    dome = doc.addObject("Part::Ellipsoid", "{struct_id}_dome")
+    dome.Radius1 = {dome_height_mm}  # Z-direction (dome height)
+    dome.Radius2 = {radius_mm}       # X-direction (horizontal radius)
+    dome.Radius3 = {radius_mm}       # Y-direction (horizontal radius)
+    dome.Angle1 = 0                  # Start at equator
+    dome.Angle2 = 90                 # End at top (hemisphere)
+    dome.Angle3 = 360                # Full rotation
+    dome.Label = "{struct_id}_dome"
+
+    # Position dome on top of tank
+    dome.Placement.Base.z = {tank_height_mm}
+
+    # Create compound to group tank + dome
+    compound = doc.addObject("Part::Compound", "{struct_id}")
+    compound.Links = [tank, dome]
+    compound.Label = "{struct_id}"
+
+    # Add EquipmentId for stable lookup (on compound, not individual parts)
+    try:
+        compound.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
+    except Exception:
+        pass
+    compound.EquipmentId = "{struct_id}"
+
+    try:
+        compound.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
+    except Exception:
+        pass
+    compound.EquipmentType = "{struct_type}"
+
+    doc.recompute()
+    print("EQUIP_STATUS:created:{struct_id}:" + compound.Name)
+'''
+                        else:
+                            # Non-digester circular equipment: simple cylinder
+                            equip_code = f'''
 import FreeCAD
 import Part
 
@@ -1261,8 +1357,18 @@ else:
         print("EQUIP_STATUS:created:{struct_id}:" + actual_name)
 '''
                     else:  # rectangle
-                        width = footprint.get("w", 10.0)
-                        length = footprint.get("h", 10.0)
+                        orig_w = footprint.get("w", 10.0)
+                        orig_h = footprint.get("h", 10.0)
+
+                        # Look up placement to get rotation_deg for dimension swapping
+                        placement = next(
+                            (p for p in placements_data if p.get("id") == struct_id),
+                            None
+                        )
+                        rotation_deg = placement.get("rotation_deg", 0) if placement else 0
+
+                        # Pre-swap dimensions for 90/270 rotation (no FreeCAD rotation needed)
+                        width, length = get_rect_dims_at_rotation(orig_w, orig_h, rotation_deg)
                         width_mm = width * M_TO_MM
                         length_mm = length * M_TO_MM
                         height_mm = struct_height * M_TO_MM
@@ -1288,12 +1394,12 @@ else:
     box = doc.addObject("Part::Box", "{struct_id}")
     # Accept the object regardless of auto-rename (FreeCAD adds suffix on collision)
     actual_name = box.Name
-    box.Width = {width_mm}
-    box.Length = {length_mm}
+    box.Width = {width_mm}   # Pre-swapped for rotation
+    box.Length = {length_mm}  # Pre-swapped for rotation
     box.Height = {height_mm}
     box.Label = "{struct_id}"  # Display name
-    box.Placement.Base.x = -{width_mm / 2}
-    box.Placement.Base.y = -{length_mm / 2}
+    # NOTE: Dimensions are pre-swapped based on rotation_deg, so no Placement.Rotation needed
+    # apply_placements handles center-to-corner conversion using swapped dimensions
 
     # Add EquipmentId for stable lookup (survives name collisions)
     try:
@@ -1385,31 +1491,26 @@ for p in placements:
 
     current_z = obj.Placement.Base.z
 
-    # For Part::Box (rectangular equipment), calculate corner position after rotation
-    # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER
-    # We must rotate the corner offset so the CENTER ends up at (x, y)
+    # Create rotation around Z axis
+    rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), rotation_deg)
+
+    # For Part::Box (rectangular equipment), calculate corner position
+    # Site-fit provides CENTER coordinates, but FreeCAD Part::Box uses CORNER as origin
+    # FreeCAD Placement rotation happens around Placement.Base (the corner), not geometric center
+    # Formula: Base = center_world - R * center_local
     if obj.TypeId == "Part::Box":
-        half_length = obj.Length / 2
-        half_width = obj.Width / 2
+        # FreeCAD Part::Box dimensions: Width=X, Length=Y, Height=Z
+        half_x = obj.Width.Value / 2.0
+        half_y = obj.Length.Value / 2.0
+        center_local = FreeCAD.Vector(half_x, half_y, 0)
 
-        # Rotate corner offset around center
-        theta = math.radians(rotation_deg)
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-
-        # Offset from center to corner (before rotation): (-half_length, -half_width)
-        # After rotation: apply 2D rotation matrix
-        rotated_offset_x = -half_length * cos_t + half_width * sin_t
-        rotated_offset_y = -half_length * sin_t - half_width * cos_t
-
-        corner_x = x + rotated_offset_x
-        corner_y = y + rotated_offset_y
-        new_pos = FreeCAD.Vector(corner_x, corner_y, current_z)
+        # Compute base so that center ends up at (x, y) after rotation
+        center_world = FreeCAD.Vector(x, y, current_z)
+        new_pos = center_world - rotation.multVec(center_local)
     else:
         # Cylinders and other shapes are already centered
         new_pos = FreeCAD.Vector(x, y, current_z)
 
-    rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), rotation_deg)
     obj.Placement = FreeCAD.Placement(new_pos, rotation)
     updated += 1
 
@@ -1529,28 +1630,354 @@ print("view_ok")
             return [TextContent(type="text", text=f"Failed to import contract: {str(e)}")]
 
     @mcp.tool()
-    async def present_layout_options(
-        doc_prefix: str,
+    async def import_solutions_as_layers(
+        doc_name: str,
         solutions: list[dict],
         site_boundary: list[list[float]] | None = None,
+        keepouts: list[dict] | None = None,
+        active_layer_index: int = 0,
         include_screenshot: bool = False,
         detail_level: DetailLevel = "compact",
         ctx: Context = None,
     ) -> list[TextContent | ImageContent]:
-        """Create separate FreeCAD documents for each layout solution.
+        """Import multiple site-fit solutions as toggleable layers in a single document.
+
+        Creates a layer structure for easy visibility toggling:
+        - Common layer: site boundary, keepouts (always visible)
+        - Solution layers: equipment + roads for each solution
+
+        Args:
+            doc_name: Name for the FreeCAD document (created if doesn't exist)
+            solutions: List of solution dicts, each with:
+                - solution_id: str
+                - rank: int
+                - placements: list of {structure_id, x, y, rotation_deg}
+                - structures: list of structure definitions
+            site_boundary: Site boundary [[x,y], ...] in meters
+            keepouts: Optional keepout zones
+            active_layer_index: Which solution layer is visible by default (0-indexed)
+
+        Returns:
+            Summary with layer names and visibility toggle instructions
+
+        Example:
+            import_solutions_as_layers(
+                doc_name="SitePlan",
+                solutions=[
+                    {"solution_id": "sol_001", "rank": 1, "placements": [...], "structures": [...]},
+                    {"solution_id": "sol_002", "rank": 2, "placements": [...], "structures": [...]}
+                ],
+                site_boundary=[[0,0], [150,0], [150,100], [0,100], [0,0]],
+                active_layer_index=0
+            )
+        """
+        freecad = get_freecad_connection()
+
+        try:
+            # 1. Create or get document
+            doc_code = f'''
+import FreeCAD
+doc = FreeCAD.getDocument("{doc_name}")
+if not doc:
+    doc = FreeCAD.newDocument("{doc_name}")
+    print("DOC_STATUS:created")
+else:
+    print("DOC_STATUS:exists")
+'''
+            freecad.execute_code(doc_code)
+
+            # 2. Create Common layer with boundary
+            common_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+
+# Create Common group for shared elements
+common_group = doc.addObject("App::DocumentObjectGroup", "Common")
+common_group.Label = "Common"
+'''
+            if site_boundary:
+                points_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in site_boundary]
+                common_code += f'''
+# Create site boundary
+points = [FreeCAD.Vector(p[0], p[1], 0) for p in {points_mm}]
+wire = Draft.make_wire(points, closed=True, face=False)
+wire.Label = "SiteBoundary"
+common_group.addObject(wire)
+'''
+            common_code += '''
+doc.recompute()
+print("common_ok")
+'''
+            freecad.execute_code(common_code)
+
+            # 3. Create a layer for each solution
+            created_layers = []
+            for idx, sol in enumerate(solutions):
+                sol_id = sol.get("solution_id", f"sol_{idx}")
+                rank = sol.get("rank", idx + 1)
+                placements = sol.get("placements", [])
+                structures = sol.get("structures", [])
+                layer_name = f"Layout_{idx + 1}_Rank{rank}"
+                is_active = (idx == active_layer_index)
+
+                # Create layer group
+                layer_code = f'''
+import FreeCAD
+import Part
+
+doc = FreeCAD.getDocument("{doc_name}")
+
+# Create layer group
+layer = doc.addObject("App::DocumentObjectGroup", "{layer_name}")
+layer.Label = "{layer_name}"
+
+# Create equipment subgroup
+equip_group = doc.addObject("App::DocumentObjectGroup", "{layer_name}_Equipment")
+equip_group.Label = "Equipment"
+layer.addObject(equip_group)
+
+doc.recompute()
+print("layer_ok")
+'''
+                freecad.execute_code(layer_code)
+
+                # Create equipment for this layer
+                for struct in structures:
+                    struct_id = struct.get("id", "Unknown")
+                    struct_type = struct.get("type", "equipment")
+                    footprint = struct.get("footprint", {})
+                    shape = footprint.get("shape", "rect")
+                    struct_height = struct.get("height", 5.0)
+                    height_mm = struct_height * M_TO_MM
+
+                    # Find placement for this structure
+                    placement = next(
+                        (p for p in placements if p.get("structure_id") == struct_id or p.get("id") == struct_id),
+                        None
+                    )
+                    x_m = placement.get("x", 0) if placement else 0
+                    y_m = placement.get("y", 0) if placement else 0
+                    rotation_deg = placement.get("rotation_deg", 0) if placement else 0
+                    x_mm = x_m * M_TO_MM
+                    y_mm = y_m * M_TO_MM
+
+                    # Unique object name for this layer
+                    obj_name = f"{struct_id.replace('-', '_')}_L{idx + 1}"
+
+                    if shape == "circle":
+                        diameter = footprint.get("d", 10.0)
+                        radius_mm = (diameter / 2) * M_TO_MM
+                        equip_code = f'''
+import FreeCAD
+import Part
+
+doc = FreeCAD.getDocument("{doc_name}")
+layer = doc.getObject("{layer_name}")
+equip_group = doc.getObject("{layer_name}_Equipment")
+
+cyl = doc.addObject("Part::Cylinder", "{obj_name}")
+cyl.Radius = {radius_mm}
+cyl.Height = {height_mm}
+cyl.Label = "{struct_id}"
+cyl.Placement = FreeCAD.Placement(FreeCAD.Vector({x_mm}, {y_mm}, 0), FreeCAD.Rotation())
+equip_group.addObject(cyl)
+doc.recompute()
+'''
+                    else:  # rectangle
+                        orig_w = footprint.get("w", 10.0)
+                        orig_h = footprint.get("h", 10.0)
+
+                        # Pre-swap dimensions for 90/270 rotation
+                        if rotation_deg in (90, 270):
+                            width, length = orig_h, orig_w
+                        else:
+                            width, length = orig_w, orig_h
+
+                        width_mm = width * M_TO_MM
+                        length_mm = length * M_TO_MM
+                        half_x = width_mm / 2.0
+                        half_y = length_mm / 2.0
+                        corner_x = x_mm - half_x
+                        corner_y = y_mm - half_y
+
+                        equip_code = f'''
+import FreeCAD
+import Part
+
+doc = FreeCAD.getDocument("{doc_name}")
+layer = doc.getObject("{layer_name}")
+equip_group = doc.getObject("{layer_name}_Equipment")
+
+box = doc.addObject("Part::Box", "{obj_name}")
+box.Width = {width_mm}
+box.Length = {length_mm}
+box.Height = {height_mm}
+box.Label = "{struct_id}"
+box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x}, {corner_y}, 0), FreeCAD.Rotation())
+equip_group.addObject(box)
+doc.recompute()
+'''
+                    freecad.execute_code(equip_code)
+
+                # Set layer visibility
+                visibility_code = f'''
+import FreeCAD
+
+doc = FreeCAD.getDocument("{doc_name}")
+layer = doc.getObject("{layer_name}")
+if hasattr(layer, "ViewObject") and layer.ViewObject:
+    layer.ViewObject.Visibility = {is_active}
+doc.recompute()
+'''
+                freecad.execute_code(visibility_code)
+
+                created_layers.append({
+                    "layer_name": layer_name,
+                    "solution_id": sol_id,
+                    "rank": rank,
+                    "equipment_count": len(structures),
+                    "visible": is_active
+                })
+
+            # Set view
+            view_code = f'''
+import FreeCAD
+import FreeCADGui
+
+doc = FreeCAD.getDocument("{doc_name}")
+doc.recompute()
+FreeCADGui.ActiveDocument.ActiveView.viewTop()
+FreeCADGui.ActiveDocument.ActiveView.fitAll()
+'''
+            freecad.execute_code(view_code)
+
+            # Build summary
+            summary = [f"Created {len(created_layers)} solution layers in '{doc_name}':"]
+            for layer_info in created_layers:
+                visibility = "VISIBLE" if layer_info["visible"] else "hidden"
+                summary.append(f"  - {layer_info['layer_name']} (Rank {layer_info['rank']}) [{visibility}]")
+                summary.append(f"    Equipment: {layer_info['equipment_count']}")
+
+            summary.append("\nUse set_layout_visibility() to toggle between solutions.")
+
+            screenshot = freecad.get_active_screenshot()
+            response = [TextContent(type="text", text="\n".join(summary))]
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
+
+        except Exception as e:
+            logger.error(f"Failed to import solutions as layers: {str(e)}")
+            return [TextContent(type="text", text=f"Failed to import solutions: {str(e)}")]
+
+    @mcp.tool()
+    async def set_layout_visibility(
+        doc_name: str,
+        visible_layer: str | None = None,
+        show_all: bool = False,
+        include_screenshot: bool = False,
+        ctx: Context = None,
+    ) -> list[TextContent | ImageContent]:
+        """Toggle visibility of solution layers for comparison.
+
+        Args:
+            doc_name: Document name
+            visible_layer: Layer name to show (hides others except Common)
+            show_all: If True, show all solution layers for overlay comparison
+
+        Examples:
+            # Show only Layout_1:
+            set_layout_visibility(doc_name="SitePlan", visible_layer="Layout_1_Rank1")
+
+            # Show all layers overlaid:
+            set_layout_visibility(doc_name="SitePlan", show_all=True)
+
+            # Hide all solution layers (show only Common):
+            set_layout_visibility(doc_name="SitePlan")
+        """
+        freecad = get_freecad_connection()
+
+        try:
+            toggle_code = f'''
+import FreeCAD
+
+doc = FreeCAD.getDocument("{doc_name}")
+if not doc:
+    raise ValueError("Document '{doc_name}' not found")
+
+# Get all layer groups (exclude "Common")
+layer_groups = [obj for obj in doc.Objects
+                if obj.TypeId == "App::DocumentObjectGroup"
+                and obj.Name.startswith("Layout_")]
+
+visible_layer = "{visible_layer or ''}"
+show_all = {show_all}
+
+updated = []
+for layer in layer_groups:
+    if layer.ViewObject:
+        if show_all:
+            layer.ViewObject.Visibility = True
+            updated.append(f"{{layer.Name}}: visible")
+        elif visible_layer and layer.Name == visible_layer:
+            layer.ViewObject.Visibility = True
+            updated.append(f"{{layer.Name}}: visible")
+        elif visible_layer:
+            layer.ViewObject.Visibility = False
+            updated.append(f"{{layer.Name}}: hidden")
+        else:
+            # No specific layer, hide all
+            layer.ViewObject.Visibility = False
+            updated.append(f"{{layer.Name}}: hidden")
+
+doc.recompute()
+print(__import__("json").dumps({{"layers": updated}}))
+'''
+            res = freecad.execute_code(toggle_code)
+
+            if show_all:
+                summary = f"All solution layers in '{doc_name}' are now visible for comparison."
+            elif visible_layer:
+                summary = f"Layer '{visible_layer}' is now visible. Other solution layers are hidden."
+            else:
+                summary = f"All solution layers in '{doc_name}' are now hidden. Only Common layer visible."
+
+            screenshot = freecad.get_active_screenshot()
+            response = [TextContent(type="text", text=summary)]
+            return add_screenshot_if_available(response, screenshot, include_screenshot)
+
+        except Exception as e:
+            logger.error(f"Failed to toggle visibility: {str(e)}")
+            return [TextContent(type="text", text=f"Failed to toggle visibility: {str(e)}")]
+
+    @mcp.tool()
+    async def present_layout_options(
+        doc_prefix: str,
+        solutions: list[dict],
+        site_boundary: list[list[float]] | None = None,
+        use_single_document: bool = True,
+        include_screenshot: bool = False,
+        detail_level: DetailLevel = "compact",
+        ctx: Context = None,
+    ) -> list[TextContent | ImageContent]:
+        """Create FreeCAD layout options for human review.
 
         Enables human-in-the-loop review of multiple feasible layouts.
-        Each solution gets its own document for side-by-side comparison.
+        By default, creates all solutions as toggleable layers in a single document
+        for easy comparison. Set use_single_document=False for legacy multi-document
+        behavior.
 
         Args:
             doc_prefix: Prefix for document names (e.g., "CBG_SitePlan")
             solutions: List of solution dicts from sitefit_list_solutions, each with:
                        solution_id, rank, metrics, placements, structures
             site_boundary: Optional site boundary [[x,y], ...] in meters
+            use_single_document: If True (default), creates all solutions as layers
+                       in a single document. If False, creates separate documents.
             ctx: MCP context
 
         Returns:
-            List of created documents with solution IDs and metrics
+            List of created documents/layers with solution IDs and metrics
 
         Examples:
             ```json
@@ -1569,6 +1996,19 @@ print("view_ok")
             }
             ```
         """
+        # New default: use single document with layers for easier comparison
+        if use_single_document:
+            return await import_solutions_as_layers(
+                doc_name=doc_prefix,
+                solutions=solutions,
+                site_boundary=site_boundary,
+                active_layer_index=0,
+                include_screenshot=include_screenshot,
+                detail_level=detail_level,
+                ctx=ctx,
+            )
+
+        # Legacy multi-document behavior
         freecad = get_freecad_connection()
         if not freecad.check_connection():
             return [TextContent(type="text", text="FreeCAD connection not available")]
@@ -1660,35 +2100,38 @@ doc.recompute()
 print("equip_ok")
 '''
                 else:  # rectangle
-                    import math
-                    width = footprint.get("w", 10.0)
-                    length = footprint.get("h", 10.0)
+                    orig_w = footprint.get("w", 10.0)   # Contract w = X dimension at 0°
+                    orig_h = footprint.get("h", 10.0)   # Contract h = Y dimension at 0°
+
+                    # Pre-swap dimensions for 90/270 rotation (no FreeCAD rotation needed)
+                    if rotation_deg in (90, 270):
+                        width, length = orig_h, orig_w
+                    else:
+                        width, length = orig_w, orig_h
+
                     width_mm = width * M_TO_MM
                     length_mm = length * M_TO_MM
-                    # Calculate corner from center with rotation
-                    # Rotate corner offset so center ends up at (x_mm, y_mm)
-                    theta = math.radians(rotation_deg)
-                    cos_t = math.cos(theta)
-                    sin_t = math.sin(theta)
-                    half_w = width_mm / 2
-                    half_l = length_mm / 2
-                    rotated_offset_x = -half_w * cos_t + half_l * sin_t
-                    rotated_offset_y = -half_w * sin_t - half_l * cos_t
-                    corner_x_mm = x_mm + rotated_offset_x
-                    corner_y_mm = y_mm + rotated_offset_y
+                    # FreeCAD Part::Box: Width=X, Length=Y, Height=Z
+                    # Dimensions are pre-swapped, so simple center-to-corner offset
+                    half_x_mm = width_mm / 2.0
+                    half_y_mm = length_mm / 2.0
+                    corner_x = x_mm - half_x_mm
+                    corner_y = y_mm - half_y_mm
+
                     equip_code = f'''
 import FreeCAD
 import Part
 
 doc = FreeCAD.getDocument("{doc_name}")
 box = doc.addObject("Part::Box", "{struct_id}")
-box.Length = {width_mm}
-box.Width = {length_mm}
+box.Width = {width_mm}   # Pre-swapped X dimension
+box.Length = {length_mm}  # Pre-swapped Y dimension
 box.Height = {height_mm}
 box.Label = "{struct_id}"
-# Apply position with rotated corner offset and rotation
-rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), {rotation_deg})
-box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x_mm}, {corner_y_mm}, 0), rotation)
+
+# Simple corner placement (dimensions pre-swapped, no rotation needed)
+box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x}, {corner_y}, 0), FreeCAD.Rotation())
+
 box.addProperty("App::PropertyString", "EquipmentType", "ProcessEng", "Equipment type")
 box.EquipmentType = "{struct_type}"
 box.addProperty("App::PropertyString", "EquipmentId", "ProcessEng", "Stable equipment ID")
@@ -1747,6 +2190,8 @@ print("view_ok")
         export_pdf_path: str | None = None,
         cleanup_other_options: bool = False,
         other_option_docs: list[str] | None = None,
+        layer_name: str | None = None,
+        delete_other_layers: bool = False,
         include_screenshot: bool = False,
         detail_level: DetailLevel = "compact",
         ctx: Context = None,
@@ -1756,8 +2201,11 @@ print("view_ok")
         After reviewing multiple layout options with present_layout_options,
         call this to finalize the selected option and optionally clean up others.
 
+        Supports both layer-based workflow (single document with layers) and
+        legacy multi-document workflow.
+
         Args:
-            doc_name: Name of the selected document
+            doc_name: Name of the document
             solution_id: ID of the selected solution (for tracking)
             project_name: Project name for TechDraw title block
             drawing_number: Drawing number for TechDraw title block
@@ -1765,6 +2213,8 @@ print("view_ok")
             export_pdf_path: Optional path to export PDF
             cleanup_other_options: Remove other option documents (default: False)
             other_option_docs: List of other document names to close (if cleanup requested)
+            layer_name: Layer group name to finalize (for layer-based workflow)
+            delete_other_layers: Delete other layout layers (default: False, just hides them)
             ctx: MCP context
 
         Returns:
@@ -1779,7 +2229,9 @@ print("view_ok")
             "solution_id": solution_id,
             "techdraw_generated": False,
             "pdf_exported": False,
-            "docs_closed": 0
+            "docs_closed": 0,
+            "layers_hidden": 0,
+            "layers_deleted": 0
         }
 
         # Verify document exists and activate it
@@ -1797,7 +2249,58 @@ else:
         if "doc_not_found" in res.get("message", ""):
             return [TextContent(type="text", text=f"Document '{doc_name}' not found")]
 
-        # Cleanup other option documents if requested
+        # Handle layer-based workflow
+        if layer_name:
+            layer_code = f'''
+import FreeCAD
+import FreeCADGui
+
+doc = FreeCAD.getDocument("{doc_name}")
+layers_hidden = 0
+layers_deleted = 0
+
+# Find all Layout_* groups
+layout_groups = [obj for obj in doc.Objects
+                 if obj.TypeId == "App::DocumentObjectGroup"
+                 and obj.Label.startswith("Layout_")]
+
+for group in layout_groups:
+    if group.Label == "{layer_name}":
+        # Keep selected layer visible
+        if hasattr(group, "ViewObject") and group.ViewObject:
+            group.ViewObject.Visibility = True
+    else:
+        # Hide or delete other layers
+        if {str(delete_other_layers).lower()}:
+            # Delete the layer and its contents
+            for child in group.Group:
+                doc.removeObject(child.Name)
+            doc.removeObject(group.Name)
+            layers_deleted += 1
+        else:
+            # Just hide
+            if hasattr(group, "ViewObject") and group.ViewObject:
+                group.ViewObject.Visibility = False
+            layers_hidden += 1
+
+doc.recompute()
+print(f"layers_hidden={{layers_hidden}}")
+print(f"layers_deleted={{layers_deleted}}")
+'''
+            layer_res = freecad.execute_code(layer_code)
+            msg = layer_res.get("message", "")
+            if "layers_hidden=" in msg:
+                try:
+                    results["layers_hidden"] = int(msg.split("layers_hidden=")[1].split()[0])
+                except (IndexError, ValueError):
+                    pass
+            if "layers_deleted=" in msg:
+                try:
+                    results["layers_deleted"] = int(msg.split("layers_deleted=")[1].split()[0])
+                except (IndexError, ValueError):
+                    pass
+
+        # Cleanup other option documents if requested (legacy multi-document workflow)
         if cleanup_other_options and other_option_docs:
             for other_doc in other_option_docs:
                 if other_doc != doc_name:
@@ -1884,6 +2387,12 @@ if page:
         # Build summary
         summary = [f"Finalized layout: {doc_name}"]
         summary.append(f"  Solution ID: {solution_id}")
+        if layer_name:
+            summary.append(f"  Selected layer: {layer_name}")
+        if results["layers_hidden"] > 0:
+            summary.append(f"  Other layers hidden: {results['layers_hidden']}")
+        if results["layers_deleted"] > 0:
+            summary.append(f"  Other layers deleted: {results['layers_deleted']}")
         if results["techdraw_generated"]:
             summary.append("  TechDraw plan sheet: Generated")
         if results["pdf_exported"]:
