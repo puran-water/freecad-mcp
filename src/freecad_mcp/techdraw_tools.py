@@ -4,17 +4,17 @@ This module provides MCP tools for creating TechDraw plan sheets from
 3D FreeCAD models, with proper title blocks, scales, and export to PDF/DXF.
 """
 
-import logging
 from datetime import datetime
 from typing import Any, Callable
 
+import structlog
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path
 from .response_filters import DetailLevel
 
-logger = logging.getLogger("FreeCADMCPserver.techdraw")
+logger = structlog.get_logger("FreeCADMCPserver.techdraw")
 
 # Standard template sizes (mm)
 TEMPLATE_SIZES = {
@@ -559,8 +559,198 @@ print(result_msg)
                 return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to create TechDraw page: {e}")
+            logger.error("create_techdraw_page_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to create TechDraw page: {e}")]
+
+    @mcp.tool()
+    def techdraw_preflight(
+        ctx: Context,
+        doc_name: str,
+    ) -> list[TextContent]:
+        """Check TechDraw readiness before export.
+
+        Verifies GUI availability, Xvfb presence, and display settings.
+        Provides recommendations if TechDraw export may fail.
+
+        Args:
+            doc_name: Name of the FreeCAD document to check
+
+        Returns:
+            Preflight check results with recommendations
+
+        Examples:
+            Check if TechDraw export will work:
+            ```json
+            {
+                "doc_name": "SitePlan"
+            }
+            ```
+        """
+        import os
+        import shutil
+
+        freecad = get_freecad_connection()
+
+        # Check local environment (MCP server side)
+        xvfb_available = shutil.which("xvfb-run") is not None
+        display_set = "DISPLAY" in os.environ
+        display_value = os.environ.get("DISPLAY", "")
+
+        # Check FreeCAD side via RPC
+        code = '''
+import FreeCAD
+import sys
+import os
+
+result = {
+    "freecad_version": ".".join(str(x) for x in FreeCAD.Version()[:3]),
+    "gui_available": hasattr(FreeCAD, "Gui") and FreeCAD.GuiUp,
+    "techdraw_module": False,
+    "techdraw_gui_module": False,
+    "display_env": os.environ.get("DISPLAY", ""),
+    "platform": sys.platform,
+    "visible_objects": 0,
+    "template_search_paths": [],
+}
+
+# Check TechDraw module
+try:
+    import TechDraw
+    result["techdraw_module"] = True
+except ImportError:
+    pass
+
+# Check TechDrawGui module (requires GUI)
+try:
+    import TechDrawGui
+    result["techdraw_gui_module"] = True
+except ImportError:
+    pass
+
+# Check document and visible objects
+doc = FreeCAD.getDocument("DOC_NAME")
+if doc:
+    result["visible_objects"] = len([obj for obj in doc.Objects
+        if hasattr(obj, "ViewObject") and obj.ViewObject and obj.ViewObject.Visibility])
+
+# Get template search paths
+try:
+    pref = FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/TechDraw/Files")
+    template_dir = pref.GetString("TemplateDir", "")
+    if template_dir:
+        result["template_search_paths"].append(template_dir)
+
+    # Add default resource path
+    resource_dir = os.path.join(FreeCAD.getResourceDir(), "Mod", "TechDraw", "Templates")
+    if os.path.isdir(resource_dir):
+        result["template_search_paths"].append(resource_dir)
+except:
+    pass
+
+print(repr(result))
+'''.replace("DOC_NAME", doc_name)
+
+        try:
+            res = freecad.execute_code(code)
+
+            if res.get("success"):
+                # Parse the result from FreeCAD
+                output = res.get("message", "")
+                try:
+                    fc_info = eval(output)  # Safe: we control the code
+                except:
+                    fc_info = {}
+            else:
+                fc_info = {"error": res.get("error", "Unknown error")}
+
+        except Exception as e:
+            fc_info = {"error": str(e)}
+
+        # Build preflight report
+        gui_available = fc_info.get("gui_available", False)
+        techdraw_gui = fc_info.get("techdraw_gui_module", False)
+        can_export_pdf = gui_available and techdraw_gui
+
+        recommendations = []
+        if not gui_available:
+            if xvfb_available:
+                recommendations.append("Run FreeCAD with Xvfb: xvfb-run -a freecad ...")
+            else:
+                recommendations.append("Install Xvfb: apt install xvfb")
+            recommendations.append("Or set QT_QPA_PLATFORM=offscreen before starting FreeCAD")
+            recommendations.append("Or use sitefit_export_pack for guaranteed headless PDF output")
+
+        if not techdraw_gui and gui_available:
+            recommendations.append("TechDrawGui module not available - check FreeCAD installation")
+
+        if not display_set and not fc_info.get("platform", "").startswith("win"):
+            recommendations.append("DISPLAY environment variable not set")
+
+        # Build response
+        report = {
+            "preflight_status": "ready" if can_export_pdf else "not_ready",
+            "can_export_pdf": can_export_pdf,
+            "gui_available": gui_available,
+            "techdraw_module": fc_info.get("techdraw_module", False),
+            "techdraw_gui_module": techdraw_gui,
+            "xvfb_available": xvfb_available,
+            "display_set": display_set,
+            "display_value": display_value or fc_info.get("display_env", ""),
+            "freecad_version": fc_info.get("freecad_version", "unknown"),
+            "platform": fc_info.get("platform", "unknown"),
+            "visible_objects": fc_info.get("visible_objects", 0),
+            "template_search_paths": fc_info.get("template_search_paths", []),
+            "recommendations": recommendations,
+            "fallback_available": "sitefit_export_pack",
+        }
+
+        if "error" in fc_info:
+            report["error"] = fc_info["error"]
+
+        # Format as readable text
+        lines = [
+            "TechDraw Preflight Check",
+            "=" * 40,
+            f"Status: {report['preflight_status'].upper()}",
+            f"Can export PDF: {report['can_export_pdf']}",
+            "",
+            "Environment:",
+            f"  FreeCAD version: {report['freecad_version']}",
+            f"  Platform: {report['platform']}",
+            f"  GUI available: {report['gui_available']}",
+            f"  TechDraw module: {report['techdraw_module']}",
+            f"  TechDrawGui module: {report['techdraw_gui_module']}",
+            f"  DISPLAY: {report['display_value'] or '(not set)'}",
+            f"  Xvfb available: {report['xvfb_available']}",
+            "",
+            f"Document '{doc_name}':",
+            f"  Visible objects: {report['visible_objects']}",
+        ]
+
+        if report["template_search_paths"]:
+            lines.append("")
+            lines.append("Template search paths:")
+            for path in report["template_search_paths"]:
+                lines.append(f"  - {path}")
+
+        if recommendations:
+            lines.append("")
+            lines.append("Recommendations:")
+            for rec in recommendations:
+                lines.append(f"  - {rec}")
+
+        if "error" in report:
+            lines.append("")
+            lines.append(f"Error: {report['error']}")
+
+        logger.info(
+            "techdraw_preflight_complete",
+            doc_name=doc_name,
+            can_export_pdf=can_export_pdf,
+            gui_available=gui_available,
+        )
+
+        return [TextContent(type="text", text="\n".join(lines))]
 
     @mcp.tool()
     def list_techdraw_templates(ctx: Context) -> list[TextContent]:
@@ -615,6 +805,15 @@ print(result_msg)
 import FreeCAD
 import TechDraw
 import os
+import sys
+
+# Collect diagnostics
+diagnostics = {{
+    "freecad_version": ".".join(str(x) for x in FreeCAD.Version()[:3]),
+    "gui_mode": hasattr(FreeCAD, "Gui") and FreeCAD.GuiUp,
+    "platform": sys.platform,
+    "display_env": os.environ.get("DISPLAY", ""),
+}}
 
 doc = FreeCAD.getDocument("{doc_name}")
 if doc is None:
@@ -627,7 +826,12 @@ if page is None:
 if not page.TypeId.startswith("TechDraw::DrawPage"):
     raise ValueError("Object '{page_name}' is not a TechDraw page")
 
+# Count views in page
+diagnostics["views_in_page"] = len([v for v in page.Views if hasattr(v, 'TypeId')])
+diagnostics["template_found"] = page.Template is not None
+
 export_results = []
+export_errors = []
 
 pdf_path = "{export_pdf_path or ''}"
 dxf_path = "{export_dxf_path or ''}"
@@ -639,13 +843,22 @@ if pdf_path:
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
         import TechDrawGui
+        diagnostics["techdraw_gui_available"] = True
         TechDrawGui.exportPageAsPdf(page, pdf_path)
         if os.path.exists(pdf_path):
             export_results.append(f"PDF: {{pdf_path}} ({{os.path.getsize(pdf_path)}} bytes)")
         else:
-            export_results.append(f"PDF failed: file not created at {{pdf_path}}")
+            export_errors.append({{"format": "pdf", "error": "file not created", "path": pdf_path}})
+    except ImportError as e:
+        diagnostics["techdraw_gui_available"] = False
+        export_errors.append({{
+            "format": "pdf",
+            "error": "TechDrawGui requires Qt GUI",
+            "error_code": "TECHDRAW_NO_GUI",
+            "details": str(e),
+        }})
     except Exception as e:
-        export_results.append(f"PDF failed: {{e}}")
+        export_errors.append({{"format": "pdf", "error": str(e), "error_code": "EXPORT_FAILED"}})
 
 if dxf_path:
     try:
@@ -656,9 +869,9 @@ if dxf_path:
         if os.path.exists(dxf_path):
             export_results.append(f"DXF: {{dxf_path}} ({{os.path.getsize(dxf_path)}} bytes)")
         else:
-            export_results.append(f"DXF failed: file not created at {{dxf_path}}")
+            export_errors.append({{"format": "dxf", "error": "file not created", "path": dxf_path}})
     except Exception as e:
-        export_results.append(f"DXF failed: {{e}}")
+        export_errors.append({{"format": "dxf", "error": str(e), "error_code": "EXPORT_FAILED"}})
 
 if svg_path:
     try:
@@ -669,28 +882,101 @@ if svg_path:
         if os.path.exists(svg_path):
             export_results.append(f"SVG: {{svg_path}} ({{os.path.getsize(svg_path)}} bytes)")
         else:
-            export_results.append(f"SVG failed: file not created at {{svg_path}}")
+            export_errors.append({{"format": "svg", "error": "file not created", "path": svg_path}})
     except Exception as e:
-        export_results.append(f"SVG failed: {{e}}")
+        export_errors.append({{"format": "svg", "error": str(e), "error_code": "EXPORT_FAILED"}})
 
-print("Exports: " + "; ".join(export_results))
+# Build result
+result = {{
+    "success": len(export_errors) == 0,
+    "exports": export_results,
+    "errors": export_errors,
+    "diagnostics": diagnostics,
+}}
+
+print(repr(result))
 '''
 
         try:
+            import os
+            import shutil
+
             res = freecad.execute_code(code)
             screenshot = freecad.get_active_screenshot()
 
             if res.get("success"):
-                message = res.get("message", "Export completed")
-                response = [TextContent(type="text", text=message)]
-                return add_screenshot_if_available(response, screenshot, include_screenshot)
+                output = res.get("message", "")
+                try:
+                    result = eval(output)
+                except:
+                    result = {"success": True, "exports": [output]}
+
+                if result.get("success"):
+                    exports = result.get("exports", [])
+                    message = "Export completed:\n" + "\n".join(f"  - {e}" for e in exports)
+                    response = [TextContent(type="text", text=message)]
+                    return add_screenshot_if_available(response, screenshot, include_screenshot)
+                else:
+                    # Format structured error response
+                    errors = result.get("errors", [])
+                    diagnostics = result.get("diagnostics", {})
+
+                    lines = ["TechDraw Export Failed", "=" * 40, ""]
+
+                    for err in errors:
+                        lines.append(f"Format: {err.get('format', 'unknown').upper()}")
+                        lines.append(f"  Error: {err.get('error', 'Unknown error')}")
+                        if err.get("error_code"):
+                            lines.append(f"  Code: {err.get('error_code')}")
+                        lines.append("")
+
+                    lines.append("Diagnostics:")
+                    for key, value in diagnostics.items():
+                        lines.append(f"  {key}: {value}")
+
+                    # Add recommendations
+                    recommendations = []
+                    if not diagnostics.get("gui_mode"):
+                        xvfb_available = shutil.which("xvfb-run") is not None
+                        if xvfb_available:
+                            recommendations.append("Run FreeCAD with Xvfb: xvfb-run -a freecad ...")
+                        else:
+                            recommendations.append("Install Xvfb: apt install xvfb")
+                        recommendations.append("Or set QT_QPA_PLATFORM=offscreen")
+                        recommendations.append("Or use sitefit_export_pack for guaranteed headless PDF output")
+
+                    if recommendations:
+                        lines.append("")
+                        lines.append("Recommendations:")
+                        for rec in recommendations:
+                            lines.append(f"  - {rec}")
+
+                    lines.append("")
+                    lines.append("Fallback: Use sitefit_export_pack for headless-safe PDF generation")
+
+                    logger.warning(
+                        "techdraw_export_failed",
+                        doc_name=doc_name,
+                        page_name=page_name,
+                        errors=errors,
+                        diagnostics=diagnostics,
+                    )
+
+                    response = [TextContent(type="text", text="\n".join(lines))]
+                    return add_screenshot_if_available(response, screenshot, include_screenshot)
             else:
                 error = res.get("error", "Unknown error")
+                logger.error(
+                    "techdraw_export_rpc_failed",
+                    doc_name=doc_name,
+                    page_name=page_name,
+                    error=error,
+                )
                 response = [TextContent(type="text", text=f"Export failed: {error}")]
                 return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to export TechDraw page: {e}")
+            logger.error("export_techdraw_page_failed", doc_name=doc_name, page_name=page_name, error=str(e))
             return [TextContent(type="text", text=f"Failed to export TechDraw page: {e}")]
 
-    logger.info("TechDraw tools registered")
+    logger.info("techdraw_tools_registered")

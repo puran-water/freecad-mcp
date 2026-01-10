@@ -12,19 +12,19 @@ site-fit (constraint solver) / Blender (visualization) layers.
 
 import json
 import hashlib
-import logging
 import os
 import tempfile
 from datetime import datetime
 from typing import Any
 
+import structlog
 from mcp.server.fastmcp import Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path
 from .response_filters import DetailLevel, filter_contract_response
 
-logger = logging.getLogger("FreeCADMCPserver.contract")
+logger = structlog.get_logger("FreeCADMCPserver.contract")
 
 # Unit conversion: FreeCAD uses mm internally, contract uses meters
 MM_TO_M = 0.001
@@ -48,6 +48,18 @@ def get_rect_dims_at_rotation(w: float, h: float, rotation_deg: int) -> tuple[fl
     if rotation_deg in (90, 270):
         return h, w
     return w, h
+
+
+# Phase 1D: Draft API compatibility wrapper snippet
+# Both Draft.makeWire and Draft.make_wire work (they're aliases per DeepWiki),
+# but this wrapper provides insurance against future FreeCAD API changes.
+DRAFT_MAKE_WIRE_COMPAT = """
+def _make_wire_compat(vectors, closed=False, face=False):
+    '''Version-compatible wire creation. Both names work in FreeCAD 0.19+.'''
+    import Draft
+    make_fn = getattr(Draft, 'make_wire', None) or getattr(Draft, 'makeWire')
+    return make_fn(vectors, closed=closed, face=face)
+"""
 
 
 def _extract_json_from_output(output: str) -> dict | None:
@@ -111,6 +123,220 @@ def _extract_json_from_output(output: str) -> dict | None:
         return json.loads(json_str)
 
     return None
+
+
+# Contract validation constants
+CURRENT_CONTRACT_VERSION = "1.0.0"
+SUPPORTED_CONTRACT_VERSIONS = ["1.0.0", "0.9"]  # 0.9 = legacy unversioned
+
+# JSON Schema path - shared schema from site-fit-mcp-server
+# Path relative to this file: ../../../../../../site-fit-mcp-server/schemas/spatial_contract_v1.json
+import pathlib
+_SCHEMA_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "site-fit-mcp-server" / "schemas"
+SPATIAL_CONTRACT_V1_SCHEMA_PATH = _SCHEMA_DIR / "spatial_contract_v1.json"
+
+# Cache for loaded schema
+_SCHEMA_CACHE: dict | None = None
+
+
+def _load_spatial_contract_schema() -> dict | None:
+    """Load the Spatial Contract v1.0 JSON schema from disk.
+
+    Returns:
+        Schema dict, or None if schema file not found or invalid
+    """
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE is not None:
+        return _SCHEMA_CACHE
+
+    if not SPATIAL_CONTRACT_V1_SCHEMA_PATH.exists():
+        logger.warning(
+            "schema_not_found",
+            path=str(SPATIAL_CONTRACT_V1_SCHEMA_PATH),
+            fallback="basic validation only"
+        )
+        return None
+
+    try:
+        with open(SPATIAL_CONTRACT_V1_SCHEMA_PATH) as f:
+            _SCHEMA_CACHE = json.load(f)
+        logger.debug("schema_loaded", path=str(SPATIAL_CONTRACT_V1_SCHEMA_PATH))
+        return _SCHEMA_CACHE
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning("schema_load_failed", error=str(e), fallback="basic validation only")
+        return None
+
+
+def _validate_against_schema(contract: dict) -> None:
+    """Validate contract against JSON schema if available.
+
+    Uses jsonschema library when installed, falls back to basic validation.
+    Schema validation provides comprehensive checking against v1.0 spec.
+    """
+    try:
+        import jsonschema
+    except ImportError:
+        logger.debug("jsonschema_not_installed", fallback="basic validation")
+        _validate_contract_basic(contract)
+        return
+
+    schema = _load_spatial_contract_schema()
+    if not schema:
+        # Schema not available, fall back to basic validation
+        _validate_contract_basic(contract)
+        return
+
+    try:
+        jsonschema.validate(contract, schema)
+        logger.debug("schema_validation_passed")
+    except jsonschema.ValidationError as e:
+        logger.warning("schema_validation_failed", error=e.message, path=list(e.absolute_path))
+        raise ValueError(f"Contract schema validation failed: {e.message}") from e
+
+
+def validate_and_migrate_contract(
+    contract: dict,
+    strict: bool = False,
+) -> dict:
+    """Validate and optionally migrate a spatial contract.
+
+    Uses JSON schema validation (Phase 3B) when jsonschema library is available.
+    Falls back to basic field checking if schema or library is unavailable.
+
+    Args:
+        contract: The contract dictionary to validate
+        strict: If True, reject non-1.0.0 versions. If False, attempt migration.
+
+    Returns:
+        Validated/migrated contract (always 1.0.0 format)
+
+    Raises:
+        ValueError: If contract is invalid or migration fails
+    """
+    version = contract.get("contract_version", "0.9")  # Assume legacy if missing
+
+    if version == CURRENT_CONTRACT_VERSION:
+        # Already current version, validate against schema (Phase 3B)
+        _validate_against_schema(contract)
+        logger.info("contract_validated", version=version, method="schema")
+        return contract
+
+    if strict:
+        raise ValueError(
+            f"Contract version '{version}' not supported in strict mode. "
+            f"Expected '{CURRENT_CONTRACT_VERSION}'. Re-export from site-fit."
+        )
+
+    # Migration path
+    logger.warning("contract_migration_needed", from_version=version, to_version=CURRENT_CONTRACT_VERSION)
+    migrated = _migrate_contract_to_v1(contract, version)
+    # Validate migrated contract against schema (Phase 3B)
+    _validate_against_schema(migrated)
+    logger.info("contract_migrated", from_version=version, to_version=CURRENT_CONTRACT_VERSION)
+    return migrated
+
+
+def _validate_contract_basic(contract: dict) -> None:
+    """Basic validation of contract structure."""
+    required_fields = ["contract_version", "project", "site", "placements"]
+    missing = [f for f in required_fields if f not in contract]
+    if missing:
+        raise ValueError(f"Contract missing required fields: {missing}")
+
+    if "project" in contract and "id" not in contract["project"]:
+        raise ValueError("Contract project must have 'id' field")
+
+    if "site" in contract:
+        site = contract["site"]
+        if "boundary" not in site:
+            raise ValueError("Contract site must have 'boundary' field")
+        if "units" not in site:
+            raise ValueError("Contract site must have 'units' field")
+
+
+def _migrate_contract_to_v1(contract: dict, from_version: str) -> dict:
+    """Migrate old contract format to v1.0.0."""
+    if from_version != "0.9":
+        raise ValueError(f"No migration path from version '{from_version}'")
+
+    migrated = {
+        "contract_version": CURRENT_CONTRACT_VERSION,
+    }
+
+    # Project metadata
+    if "project" in contract:
+        migrated["project"] = contract["project"]
+    else:
+        migrated["project"] = {
+            "id": contract.get("project_id", contract.get("id", "unknown")),
+            "name": contract.get("project_name", ""),
+            "revision": contract.get("revision", "A"),
+        }
+
+    if "id" not in migrated["project"]:
+        migrated["project"]["id"] = "unknown"
+
+    # Site data
+    if "site" in contract:
+        migrated["site"] = contract["site"].copy()
+    else:
+        migrated["site"] = {}
+
+    if "boundary" not in migrated["site"]:
+        if "boundary" in contract:
+            migrated["site"]["boundary"] = contract["boundary"]
+        elif "site_boundary" in contract:
+            migrated["site"]["boundary"] = contract["site_boundary"]
+        else:
+            migrated["site"]["boundary"] = []
+
+    if "units" not in migrated["site"]:
+        migrated["site"]["units"] = contract.get("units", "meters")
+
+    if "crs" not in migrated["site"]:
+        migrated["site"]["crs"] = contract.get("crs", "local")
+
+    # Program (structures)
+    if "program" in contract:
+        migrated["program"] = contract["program"]
+    elif "structures" in contract:
+        migrated["program"] = {"structures": contract["structures"]}
+    elif "equipment" in contract:
+        migrated["program"] = {"structures": contract["equipment"]}
+    else:
+        migrated["program"] = {"structures": []}
+
+    # Placements - handle structure_id -> id migration
+    placements = contract.get("placements", [])
+    migrated["placements"] = []
+    for p in placements:
+        new_p = p.copy()
+        if "structure_id" in new_p and "id" not in new_p:
+            new_p["id"] = new_p.pop("structure_id")
+        if "rotation_deg" not in new_p:
+            new_p["rotation_deg"] = new_p.get("rotation", 0)
+        migrated["placements"].append(new_p)
+
+    # Road network
+    if "road_network" in contract:
+        migrated["road_network"] = contract["road_network"]
+    elif "roads" in contract:
+        migrated["road_network"] = {"segments": contract["roads"]}
+
+    # Metrics
+    if "metrics" in contract:
+        migrated["metrics"] = contract["metrics"]
+
+    # Provenance
+    if "provenance" in contract:
+        migrated["provenance"] = contract["provenance"]
+    else:
+        migrated["provenance"] = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "solver_version": "unknown",
+        }
+
+    return migrated
 
 
 def register_contract_tools(mcp, get_freecad_connection, add_screenshot_if_available):
@@ -401,7 +627,7 @@ print(json.dumps(result))
                 return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to export contract: {str(e)}")
+            logger.error("export_contract_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to export contract: {str(e)}")]
 
     @mcp.tool()
@@ -573,7 +799,7 @@ print(__import__("json").dumps(result))
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to apply placements: {str(e)}")
+            logger.error("apply_placements_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to apply placements: {str(e)}")]
 
     @mcp.tool()
@@ -721,7 +947,7 @@ print(f"Faces: {{combined.CountFacets}}")
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to export GLB: {str(e)}")
+            logger.error("export_glb_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to export: {str(e)}")]
 
     @mcp.tool()
@@ -1016,7 +1242,7 @@ print(f"Created {{box.Name}} ({{box.Label}})")
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to create envelope: {str(e)}")
+            logger.error("create_envelope_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to create envelope: {str(e)}")]
 
     @mcp.tool()
@@ -1100,7 +1326,7 @@ print(f"Created boundary '{{wire.Label}}' with {{len(vectors)}} points")
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to create boundary: {str(e)}")
+            logger.error("create_boundary_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to create boundary: {str(e)}")]
 
     @mcp.tool()
@@ -1158,7 +1384,19 @@ print(f"Created boundary '{{wire.Label}}' with {{len(vectors)}} points")
             else:
                 contract = contract_json
 
-            # Extract data from contract
+            # Validate and migrate contract to v1.0.0 format
+            try:
+                contract = validate_and_migrate_contract(contract, strict=strict)
+                contract_version = contract.get("contract_version", "unknown")
+            except ValueError as ve:
+                logger.error("contract_validation_failed", error=str(ve))
+                return [TextContent(
+                    type="text",
+                    text=f"Contract validation failed: {ve}\n\n"
+                         f"If this is an old contract, try with strict=False to enable migration."
+                )]
+
+            # Extract data from validated contract
             site_data = contract.get("site", {})
             program_data = contract.get("program", {})
             placements_data = contract.get("placements", [])
@@ -1427,11 +1665,11 @@ else:
                         results["equipment"] += 1
                         # Log if object was auto-renamed
                         if "created_renamed" in msg:
-                            logger.info(f"Equipment {struct_id} was auto-renamed by FreeCAD due to name collision")
+                            logger.info("equipment_auto_renamed", struct_id=struct_id, reason="name_collision")
                     else:
                         error_detail = res.get("error", msg or "Unknown error")
                         results["errors"].append(f"Failed to create {struct_id}: {error_detail}")
-                        logger.error(f"Equipment creation failed for {struct_id}: {error_detail}")
+                        logger.error("equipment_creation_failed", struct_id=struct_id, error=error_detail)
 
                         # Fail fast in strict mode
                         if strict:
@@ -1534,11 +1772,13 @@ else:
                             if missing:
                                 results["errors"].append(f"Placements skipped for missing equipment: {missing}")
                                 if strict:
-                                    logger.warning(f"Strict mode: {len(missing.split(','))} equipment not found for placement")
+                                    logger.warning("strict_mode_missing_equipment", count=len(missing.split(',')), missing=missing)
                     except (ValueError, IndexError):
                         pass
 
-            # 5. Create road centerlines if requested
+            # 5. Create road geometry with visual hierarchy (Phase 4B)
+            # - Centerline (dashed gray) for civil alignment
+            # - Edge of pavement (solid black) if available
             if create_roads and road_network and road_network.get("segments"):
                 segments = road_network["segments"]
 
@@ -1557,14 +1797,20 @@ print("group_ok")
 
                 for seg in segments:
                     seg_id = seg.get("id", "road")
-                    start = seg.get("start", [0, 0])
-                    end = seg.get("end", [0, 0])
-                    waypoints = seg.get("waypoints", [])
 
-                    # Build point list: start + waypoints + end
-                    all_points = [start] + waypoints + [end]
+                    # Get centerline from either centerline array or start/end/waypoints
+                    centerline = seg.get("centerline")
+                    if centerline:
+                        all_points = centerline
+                    else:
+                        start = seg.get("start") or [0, 0]
+                        end = seg.get("end") or [0, 0]
+                        waypoints = seg.get("waypoints") or []
+                        all_points = [start] + waypoints + [end]
+
                     points_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in all_points]
 
+                    # 1. Centerline (dashed gray for civil alignment)
                     road_code = f'''
 import FreeCAD
 import Draft
@@ -1573,11 +1819,13 @@ doc = FreeCAD.getDocument("{doc_name}")
 points = {json.dumps(points_mm)}
 vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
 wire = Draft.makeWire(vectors, closed=False, face=False)
-wire.Label = "{seg_id}"
+wire.Label = "{seg_id}_CL"
 if hasattr(wire.ViewObject, "LineColor"):
     wire.ViewObject.LineColor = (0.5, 0.5, 0.5)  # Gray
 if hasattr(wire.ViewObject, "LineWidth"):
-    wire.ViewObject.LineWidth = 2.0
+    wire.ViewObject.LineWidth = 1.5
+if hasattr(wire.ViewObject, "DrawStyle"):
+    wire.ViewObject.DrawStyle = "Dashed"
 
 # Add to group
 group = doc.getObject("{road_layer_name}")
@@ -1590,6 +1838,60 @@ print("road_ok")
                     res = freecad.execute_code(road_code)
                     if "road_ok" in res.get("message", ""):
                         results["roads"] += 1
+
+                    # 2. Edge of pavement (solid black) if available
+                    edge_left = seg.get("edge_left")
+                    edge_right = seg.get("edge_right")
+
+                    if edge_left and len(edge_left) >= 2:
+                        left_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in edge_left]
+                        edge_left_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+points = {json.dumps(left_mm)}
+vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
+wire = Draft.makeWire(vectors, closed=False, face=False)
+wire.Label = "{seg_id}_EL"
+if hasattr(wire.ViewObject, "LineColor"):
+    wire.ViewObject.LineColor = (0.0, 0.0, 0.0)  # Black
+if hasattr(wire.ViewObject, "LineWidth"):
+    wire.ViewObject.LineWidth = 1.0
+
+group = doc.getObject("{road_layer_name}")
+if group:
+    group.addObject(wire)
+
+doc.recompute()
+print("edge_ok")
+'''
+                        freecad.execute_code(edge_left_code)
+
+                    if edge_right and len(edge_right) >= 2:
+                        right_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in edge_right]
+                        edge_right_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+points = {json.dumps(right_mm)}
+vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
+wire = Draft.makeWire(vectors, closed=False, face=False)
+wire.Label = "{seg_id}_ER"
+if hasattr(wire.ViewObject, "LineColor"):
+    wire.ViewObject.LineColor = (0.0, 0.0, 0.0)  # Black
+if hasattr(wire.ViewObject, "LineWidth"):
+    wire.ViewObject.LineWidth = 1.0
+
+group = doc.getObject("{road_layer_name}")
+if group:
+    group.addObject(wire)
+
+doc.recompute()
+print("edge_ok")
+'''
+                        freecad.execute_code(edge_right_code)
 
             # Final view adjustment
             view_code = f'''
@@ -1606,6 +1908,7 @@ print("view_ok")
 
             # Build summary
             summary_parts = [f"Imported site-fit contract into '{doc_name}':"]
+            summary_parts.append(f"  - Contract version: {contract_version}")
             if results["boundary"]:
                 summary_parts.append(f"  - Boundary: 1")
             if results["equipment"]:
@@ -1626,7 +1929,7 @@ print("view_ok")
         except json.JSONDecodeError as e:
             return [TextContent(type="text", text=f"Failed to parse contract JSON: {str(e)}")]
         except Exception as e:
-            logger.error(f"Failed to import contract: {str(e)}")
+            logger.error("import_contract_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to import contract: {str(e)}")]
 
     @mcp.tool()
@@ -1636,6 +1939,7 @@ print("view_ok")
         site_boundary: list[list[float]] | None = None,
         keepouts: list[dict] | None = None,
         active_layer_index: int = 0,
+        create_roads: bool = True,
         include_screenshot: bool = False,
         detail_level: DetailLevel = "compact",
         ctx: Context = None,
@@ -1653,9 +1957,11 @@ print("view_ok")
                 - rank: int
                 - placements: list of {structure_id, x, y, rotation_deg}
                 - structures: list of structure definitions
+                - road_network: optional dict with segments for road creation
             site_boundary: Site boundary [[x,y], ...] in meters
             keepouts: Optional keepout zones
             active_layer_index: Which solution layer is visible by default (0-indexed)
+            create_roads: Whether to create road centerlines per layer (default: True)
 
         Returns:
             Summary with layer names and visibility toggle instructions
@@ -1664,11 +1970,13 @@ print("view_ok")
             import_solutions_as_layers(
                 doc_name="SitePlan",
                 solutions=[
-                    {"solution_id": "sol_001", "rank": 1, "placements": [...], "structures": [...]},
+                    {"solution_id": "sol_001", "rank": 1, "placements": [...], "structures": [...],
+                     "road_network": {"segments": [{"id": "seg_0", "start": [10,10], "end": [50,50], "waypoints": []}]}},
                     {"solution_id": "sol_002", "rank": 2, "placements": [...], "structures": [...]}
                 ],
                 site_boundary=[[0,0], [150,0], [150,100], [0,100], [0,0]],
-                active_layer_index=0
+                active_layer_index=0,
+                create_roads=True
             )
         """
         freecad = get_freecad_connection()
@@ -1821,6 +2129,150 @@ doc.recompute()
 '''
                     freecad.execute_code(equip_code)
 
+                # Create roads for this layer if requested and road_network exists
+                road_count = 0
+                road_network = sol.get("road_network")
+                if create_roads and road_network and road_network.get("segments"):
+                    segments = road_network["segments"]
+
+                    # Create roads subgroup
+                    roads_group_name = f"{layer_name}_Roads"
+                    roads_group_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+layer = doc.getObject("{layer_name}")
+
+# Create roads subgroup
+roads_group = doc.addObject("App::DocumentObjectGroup", "{roads_group_name}")
+roads_group.Label = "Roads"
+layer.addObject(roads_group)
+doc.recompute()
+print("roads_group_ok")
+'''
+                    freecad.execute_code(roads_group_code)
+
+                    # Create each road segment with visual hierarchy:
+                    # - Centerline (dashed gray) for alignment
+                    # - Edge of pavement (solid black) if available
+                    for seg in segments:
+                        seg_id = seg.get("id", f"road_{road_count}")
+
+                        # Get centerline from either centerline array or start/end/waypoints
+                        centerline = seg.get("centerline")
+                        if centerline:
+                            all_points = centerline
+                        else:
+                            start = seg.get("start") or [0, 0]
+                            end = seg.get("end") or [0, 0]
+                            waypoints = seg.get("waypoints") or []
+                            all_points = [start] + waypoints + [end]
+
+                        points_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in all_points]
+
+                        # Style based on active/inactive layer (Phase 1B)
+                        # Active: solid centerline, black edges
+                        # Inactive: dashed centerline, lighter edges
+                        cl_draw_style = "Solid" if is_active else "Dashed"
+                        cl_line_width = 2.0 if is_active else 1.5
+                        cl_color = "(0.3, 0.3, 0.3)" if is_active else "(0.6, 0.6, 0.6)"  # Darker for active
+
+                        # 1. Centerline (style varies by active state)
+                        centerline_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+points = {json.dumps(points_mm)}
+vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
+wire = Draft.makeWire(vectors, closed=False, face=False)
+wire.Label = "{seg_id}_CL"
+
+# Style: active=solid darker, inactive=dashed lighter
+if hasattr(wire.ViewObject, "LineColor"):
+    wire.ViewObject.LineColor = {cl_color}
+if hasattr(wire.ViewObject, "LineWidth"):
+    wire.ViewObject.LineWidth = {cl_line_width}
+if hasattr(wire.ViewObject, "DrawStyle"):
+    wire.ViewObject.DrawStyle = "{cl_draw_style}"
+
+# Add to roads group
+roads_group = doc.getObject("{roads_group_name}")
+if roads_group:
+    roads_group.addObject(wire)
+
+doc.recompute()
+print("centerline_ok")
+'''
+                        res = freecad.execute_code(centerline_code)
+                        if "centerline_ok" in res.get("message", ""):
+                            road_count += 1
+
+                        # 2. Edge of pavement (style varies by active state)
+                        edge_left = seg.get("edge_left")
+                        edge_right = seg.get("edge_right")
+                        edge_color = "(0.0, 0.0, 0.0)" if is_active else "(0.5, 0.5, 0.5)"  # Black for active, gray for inactive
+                        edge_width = 1.5 if is_active else 1.0
+
+                        if edge_left and len(edge_left) >= 2:
+                            left_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in edge_left]
+                            edge_left_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+points = {json.dumps(left_mm)}
+vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
+wire = Draft.makeWire(vectors, closed=False, face=False)
+wire.Label = "{seg_id}_EL"
+
+# Style: active=solid black, inactive=lighter gray
+if hasattr(wire.ViewObject, "LineColor"):
+    wire.ViewObject.LineColor = {edge_color}
+if hasattr(wire.ViewObject, "LineWidth"):
+    wire.ViewObject.LineWidth = {edge_width}
+if hasattr(wire.ViewObject, "DrawStyle"):
+    wire.ViewObject.DrawStyle = "Solid"
+
+roads_group = doc.getObject("{roads_group_name}")
+if roads_group:
+    roads_group.addObject(wire)
+
+doc.recompute()
+print("edge_ok")
+'''
+                            freecad.execute_code(edge_left_code)
+
+                        if edge_right and len(edge_right) >= 2:
+                            right_mm = [[p[0] * M_TO_MM, p[1] * M_TO_MM] for p in edge_right]
+                            edge_right_code = f'''
+import FreeCAD
+import Draft
+
+doc = FreeCAD.getDocument("{doc_name}")
+points = {json.dumps(right_mm)}
+vectors = [FreeCAD.Vector(p[0], p[1], 0) for p in points]
+wire = Draft.makeWire(vectors, closed=False, face=False)
+wire.Label = "{seg_id}_ER"
+
+# Style: active=solid black, inactive=lighter gray
+if hasattr(wire.ViewObject, "LineColor"):
+    wire.ViewObject.LineColor = {edge_color}
+if hasattr(wire.ViewObject, "LineWidth"):
+    wire.ViewObject.LineWidth = 1.0
+if hasattr(wire.ViewObject, "DrawStyle"):
+    wire.ViewObject.DrawStyle = "Solid"
+
+roads_group = doc.getObject("{roads_group_name}")
+if roads_group:
+    roads_group.addObject(wire)
+
+doc.recompute()
+print("edge_ok")
+'''
+                            freecad.execute_code(edge_right_code)
+
                 # Set layer visibility
                 visibility_code = f'''
 import FreeCAD
@@ -1838,6 +2290,7 @@ doc.recompute()
                     "solution_id": sol_id,
                     "rank": rank,
                     "equipment_count": len(structures),
+                    "road_count": road_count,
                     "visible": is_active
                 })
 
@@ -1858,7 +2311,7 @@ FreeCADGui.ActiveDocument.ActiveView.fitAll()
             for layer_info in created_layers:
                 visibility = "VISIBLE" if layer_info["visible"] else "hidden"
                 summary.append(f"  - {layer_info['layer_name']} (Rank {layer_info['rank']}) [{visibility}]")
-                summary.append(f"    Equipment: {layer_info['equipment_count']}")
+                summary.append(f"    Equipment: {layer_info['equipment_count']}, Roads: {layer_info.get('road_count', 0)}")
 
             summary.append("\nUse set_layout_visibility() to toggle between solutions.")
 
@@ -1867,7 +2320,7 @@ FreeCADGui.ActiveDocument.ActiveView.fitAll()
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to import solutions as layers: {str(e)}")
+            logger.error("import_solutions_as_layers_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to import solutions: {str(e)}")]
 
     @mcp.tool()
@@ -1947,7 +2400,7 @@ print(__import__("json").dumps({{"layers": updated}}))
             return add_screenshot_if_available(response, screenshot, include_screenshot)
 
         except Exception as e:
-            logger.error(f"Failed to toggle visibility: {str(e)}")
+            logger.error("toggle_visibility_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to toggle visibility: {str(e)}")]
 
     @mcp.tool()
@@ -2404,4 +2857,4 @@ if page:
         response = [TextContent(type="text", text="\n".join(summary))]
         return add_screenshot_if_available(response, screenshot, include_screenshot)
 
-    logger.info("Contract tools registered successfully")
+    logger.info("contract_tools_registered")

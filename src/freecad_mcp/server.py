@@ -2,10 +2,12 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import xmlrpc.client
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Literal
 
+import structlog
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
 
@@ -99,11 +101,31 @@ def get_windows_host_ip() -> str:
     return "localhost"
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# Configure structured logging (JSON to stderr for MCP compatibility)
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger("FreeCADMCPserver")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    stream=sys.stderr,
+)
+
+logger = structlog.get_logger("FreeCADMCPserver")
 
 
 _only_text_feedback = False
@@ -127,11 +149,11 @@ class FreeCADConnection:
         self.host = host
         self.port = port
         self.server = xmlrpc.client.ServerProxy(f"http://{host}:{port}", allow_none=True)
-        logger.info(f"FreeCAD connection configured: {host}:{port}")
+        logger.info("freecad_connection_configured", host=host, port=port)
 
     def disconnect(self):
         """Cleanup connection (no-op for XML-RPC but required for interface)"""
-        logger.info(f"Disconnecting from FreeCAD at {self.host}:{self.port}")
+        logger.info("freecad_disconnecting", host=self.host, port=self.port)
         # XML-RPC is stateless, no actual cleanup needed
         pass
 
@@ -182,14 +204,14 @@ else:
 
             # If the view doesn't support screenshots, return None
             if not result.get("success", False) or "Current view does not support screenshots" in result.get("message", ""):
-                logger.info("Screenshot unavailable in current view (likely Spreadsheet or TechDraw view)")
+                logger.info("screenshot_unavailable", view_name=view_name, reason="unsupported_view_type")
                 return None
 
             # Otherwise, try to get the screenshot
             return self.server.get_active_screenshot(view_name)
         except Exception as e:
             # Log the error but return None instead of raising an exception
-            logger.error(f"Error getting screenshot: {e}")
+            logger.error("screenshot_failed", view_name=view_name, error=str(e))
             return None
 
     def get_objects(self, doc_name: str) -> list[dict[str, Any]]:
@@ -205,24 +227,25 @@ else:
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
-        logger.info("FreeCADMCP server starting up")
+        logger.info("server_starting")
         try:
             _ = get_freecad_connection()
-            logger.info("Successfully connected to FreeCAD on startup")
+            logger.info("freecad_connected_on_startup")
         except Exception as e:
-            logger.warning(f"Could not connect to FreeCAD on startup: {str(e)}")
             logger.warning(
-                "Make sure the FreeCAD addon is running before using FreeCAD resources or tools"
+                "freecad_connection_failed_on_startup",
+                error=str(e),
+                suggestion="Make sure the FreeCAD addon is running before using FreeCAD resources or tools",
             )
         yield {}
     finally:
         # Clean up the global connection on shutdown
         global _freecad_connection
         if _freecad_connection:
-            logger.info("Disconnecting from FreeCAD on shutdown")
+            logger.info("freecad_disconnecting_on_shutdown")
             _freecad_connection.disconnect()
             _freecad_connection = None
-        logger.info("FreeCADMCP server shut down")
+        logger.info("server_shutdown")
 
 
 mcp = FastMCP(
@@ -250,7 +273,7 @@ def get_freecad_connection():
         except Exception as e:
             host = _freecad_connection.host
             port = _freecad_connection.port
-            logger.error(f"Failed to connect to FreeCAD at {host}:{port}: {e}")
+            logger.error("freecad_connection_failed", host=host, port=port, error=str(e))
             _freecad_connection = None
             raise Exception(
                 f"Failed to connect to FreeCAD at {host}:{port}. "
@@ -314,7 +337,7 @@ def create_document(ctx: Context, name: str) -> list[TextContent]:
                 TextContent(type="text", text=f"Failed to create document: {res['error']}")
             ]
     except Exception as e:
-        logger.error(f"Failed to create document: {str(e)}")
+        logger.error("create_document_failed", doc_name=name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to create document: {str(e)}")
         ]
@@ -463,7 +486,7 @@ def create_object(
             ]
             return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to create object: {str(e)}")
+        logger.error("create_object_failed", doc_name=doc_name, obj_name=obj_name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to create object: {str(e)}")
         ]
@@ -505,7 +528,7 @@ def edit_object(
             ]
             return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to edit object: {str(e)}")
+        logger.error("edit_object_failed", doc_name=doc_name, obj_name=obj_name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to edit object: {str(e)}")
         ]
@@ -543,7 +566,7 @@ def delete_object(
             ]
             return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to delete object: {str(e)}")
+        logger.error("delete_object_failed", doc_name=doc_name, obj_name=obj_name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to delete object: {str(e)}")
         ]
@@ -579,7 +602,7 @@ def execute_code(
             ]
             return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to execute code: {str(e)}")
+        logger.error("execute_code_failed", error=str(e))
         return [
             TextContent(type="text", text=f"Failed to execute code: {str(e)}")
         ]
@@ -644,7 +667,7 @@ def insert_part_from_library(
             ]
             return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to insert part from library: {str(e)}")
+        logger.error("insert_part_failed", relative_path=relative_path, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to insert part from library: {str(e)}")
         ]
@@ -676,7 +699,7 @@ def get_objects(
         ]
         return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to get objects: {str(e)}")
+        logger.error("get_objects_failed", doc_name=doc_name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to get objects: {str(e)}")
         ]
@@ -710,7 +733,7 @@ def get_object(
         ]
         return add_screenshot_if_available(response, screenshot, include_screenshot)
     except Exception as e:
-        logger.error(f"Failed to get object: {str(e)}")
+        logger.error("get_object_failed", doc_name=doc_name, obj_name=obj_name, error=str(e))
         return [
             TextContent(type="text", text=f"Failed to get object: {str(e)}")
         ]
@@ -782,7 +805,7 @@ def main():
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback")
     args = parser.parse_args()
     _only_text_feedback = args.only_text_feedback
-    logger.info(f"Only text feedback: {_only_text_feedback}")
+    logger.info("server_config", only_text_feedback=_only_text_feedback)
     mcp.run()
 
 

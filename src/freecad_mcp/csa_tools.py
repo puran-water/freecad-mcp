@@ -15,16 +15,16 @@ communication with the CSAWorkbench addon.
 """
 
 import json
-import logging
 from typing import Any, Literal
 
+import structlog
 from mcp.server.fastmcp import Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path
 from .response_filters import DetailLevel
 
-logger = logging.getLogger("FreeCADMCPserver.csa")
+logger = structlog.get_logger("FreeCADMCPserver.csa")
 
 
 def _extract_json_from_output(output: str) -> dict | None:
@@ -201,7 +201,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to import CSA topology: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to import CSA topology: {str(e)}")
+            logger.error("import_csa_topology_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to import CSA topology: {str(e)}")]
 
     @mcp.tool()
@@ -278,7 +278,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to export CSA topology: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to export CSA topology: {str(e)}")
+            logger.error("export_csa_topology_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to export CSA topology: {str(e)}")]
 
     @mcp.tool()
@@ -380,7 +380,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to add controller: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to add controller: {str(e)}")
+            logger.error("add_csa_controller_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to add controller: {str(e)}")]
 
     @mcp.tool()
@@ -475,7 +475,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to add device: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to add device: {str(e)}")
+            logger.error("add_csa_device_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to add device: {str(e)}")]
 
     @mcp.tool()
@@ -573,7 +573,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to add link: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to add link: {str(e)}")
+            logger.error("add_csa_link_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to add link: {str(e)}")]
 
     @mcp.tool()
@@ -646,7 +646,7 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to run layout: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to run layout: {str(e)}")
+            logger.error("run_csa_layout_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to run layout: {str(e)}")]
 
     @mcp.tool()
@@ -745,5 +745,5 @@ except Exception as e:
             return [TextContent(type="text", text=f"Failed to create TechDraw sheet: {error_msg}")]
 
         except Exception as e:
-            logger.error(f"Failed to create TechDraw sheet: {str(e)}")
+            logger.error("create_csa_techdraw_sheet_failed", error=str(e))
             return [TextContent(type="text", text=f"Failed to create TechDraw sheet: {str(e)}")]
