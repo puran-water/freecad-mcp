@@ -92,7 +92,7 @@ All tools support these optional parameters:
 
 ### Spatial Contract Schema
 
-All contract JSON files follow the schema at `/home/hvksh/processeng/schemas/spatial_contract.json`.
+All contract JSON files follow the schema at `/home/hvksh/servers/processeng-workspace/schemas/spatial_contract.json`.
 
 Key points:
 - **Unit is meters** - FreeCAD mm converted internally
@@ -115,19 +115,19 @@ Copy the addon to FreeCAD's Mod directory on Windows:
 **Option A: Manual copy**
 ```powershell
 # In PowerShell, copy from WSL path to Windows FreeCAD Mod directory
-Copy-Item -Recurse "\\wsl$\Ubuntu\home\hvksh\processeng\freecad-mcp\addon\FreeCADMCP" "$env:APPDATA\FreeCAD\Mod\"
+Copy-Item -Recurse "\\wsl$\Ubuntu\home\hvksh\servers\processeng-workspace\freecad-mcp\addon\FreeCADMCP" "$env:APPDATA\FreeCAD\Mod\"
 ```
 
 **Option B: Symlink (requires Developer Mode)**
 ```powershell
 # Enable Developer Mode first in Windows Settings > Privacy & Security > For developers
-New-Item -ItemType SymbolicLink -Path "$env:APPDATA\FreeCAD\Mod\FreeCADMCP" -Target "\\wsl$\Ubuntu\home\hvksh\processeng\freecad-mcp\addon\FreeCADMCP"
+New-Item -ItemType SymbolicLink -Path "$env:APPDATA\FreeCAD\Mod\FreeCADMCP" -Target "\\wsl$\Ubuntu\home\hvksh\servers\processeng-workspace\freecad-mcp\addon\FreeCADMCP"
 ```
 
 **Option C: From WSL (using Windows path)**
 ```bash
 # From WSL, copy to Windows AppData
-cp -r /home/hvksh/processeng/freecad-mcp/addon/FreeCADMCP /mnt/c/Users/$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')/AppData/Roaming/FreeCAD/Mod/
+cp -r /home/hvksh/servers/processeng-workspace/freecad-mcp/addon/FreeCADMCP /mnt/c/Users/$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')/AppData/Roaming/FreeCAD/Mod/
 ```
 
 ### 2. Start FreeCAD (Windows)
