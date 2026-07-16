@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Literal
 
 import structlog
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
 
 # Import contract tools for process engineering

@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 import structlog
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path

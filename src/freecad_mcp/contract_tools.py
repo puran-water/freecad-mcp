@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from mcp.server.fastmcp import Context
+from fastmcp import Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path
@@ -126,14 +126,13 @@ def _extract_json_from_output(output: str) -> dict | None:
 
 
 # Contract validation constants
-CURRENT_CONTRACT_VERSION = "1.0.0"
-SUPPORTED_CONTRACT_VERSIONS = ["1.0.0", "0.9"]  # 0.9 = legacy unversioned
+CURRENT_CONTRACT_VERSION = "2.0.0"
+SUPPORTED_CONTRACT_VERSIONS = ["2.0.0", "1.0.0"]
 
-# JSON Schema path - shared schema from site-fit-mcp-server
-# Path relative to this file: ../../../../../../site-fit-mcp-server/schemas/spatial_contract_v1.json
+# JSON Schema path - shared schema from site-fit-mcp
 import pathlib
-_SCHEMA_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "site-fit-mcp-server" / "schemas"
-SPATIAL_CONTRACT_V1_SCHEMA_PATH = _SCHEMA_DIR / "spatial_contract_v1.json"
+_SCHEMA_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "site-fit-mcp" / "schemas"
+SPATIAL_CONTRACT_V1_SCHEMA_PATH = _SCHEMA_DIR / "spatial_contract_v2.json"
 
 # Cache for loaded schema
 _SCHEMA_CACHE: dict | None = None
@@ -208,12 +207,18 @@ def validate_and_migrate_contract(
         strict: If True, reject non-1.0.0 versions. If False, attempt migration.
 
     Returns:
-        Validated/migrated contract (always 1.0.0 format)
+        Validated/migrated contract (always current 2.0.0 format)
 
     Raises:
         ValueError: If contract is invalid or migration fails
     """
-    version = contract.get("contract_version", "0.9")  # Assume legacy if missing
+    version = contract.get("contract_version")
+    if version is None:
+        raise ValueError(
+            "Contract has no contract_version field. Legacy unversioned "
+            "contracts are no longer supported - re-export from site-fit "
+            "(sitefit_export_contract)."
+        )
 
     if version == CURRENT_CONTRACT_VERSION:
         # Already current version, validate against schema (Phase 3B)
@@ -255,88 +260,23 @@ def _validate_contract_basic(contract: dict) -> None:
 
 
 def _migrate_contract_to_v1(contract: dict, from_version: str) -> dict:
-    """Migrate old contract format to v1.0.0."""
-    if from_version != "0.9":
-        raise ValueError(f"No migration path from version '{from_version}'")
+    """Migrate an older contract to the current version (2.0.0).
 
-    migrated = {
-        "contract_version": CURRENT_CONTRACT_VERSION,
-    }
+    v2 fields (site.terrain, placements[].pad_elevation_m/ffe_m, tie_ins,
+    yard_piping) are additive and optional, so a v1.0.0 contract is valid
+    v2 after a version bump. Legacy unversioned (0.9) contracts are no
+    longer supported - re-export from site-fit.
+    """
+    if from_version == "1.0.0":
+        migrated = dict(contract)
+        migrated["contract_version"] = CURRENT_CONTRACT_VERSION
+        return migrated
 
-    # Project metadata
-    if "project" in contract:
-        migrated["project"] = contract["project"]
-    else:
-        migrated["project"] = {
-            "id": contract.get("project_id", contract.get("id", "unknown")),
-            "name": contract.get("project_name", ""),
-            "revision": contract.get("revision", "A"),
-        }
-
-    if "id" not in migrated["project"]:
-        migrated["project"]["id"] = "unknown"
-
-    # Site data
-    if "site" in contract:
-        migrated["site"] = contract["site"].copy()
-    else:
-        migrated["site"] = {}
-
-    if "boundary" not in migrated["site"]:
-        if "boundary" in contract:
-            migrated["site"]["boundary"] = contract["boundary"]
-        elif "site_boundary" in contract:
-            migrated["site"]["boundary"] = contract["site_boundary"]
-        else:
-            migrated["site"]["boundary"] = []
-
-    if "units" not in migrated["site"]:
-        migrated["site"]["units"] = contract.get("units", "meters")
-
-    if "crs" not in migrated["site"]:
-        migrated["site"]["crs"] = contract.get("crs", "local")
-
-    # Program (structures)
-    if "program" in contract:
-        migrated["program"] = contract["program"]
-    elif "structures" in contract:
-        migrated["program"] = {"structures": contract["structures"]}
-    elif "equipment" in contract:
-        migrated["program"] = {"structures": contract["equipment"]}
-    else:
-        migrated["program"] = {"structures": []}
-
-    # Placements - handle structure_id -> id migration
-    placements = contract.get("placements", [])
-    migrated["placements"] = []
-    for p in placements:
-        new_p = p.copy()
-        if "structure_id" in new_p and "id" not in new_p:
-            new_p["id"] = new_p.pop("structure_id")
-        if "rotation_deg" not in new_p:
-            new_p["rotation_deg"] = new_p.get("rotation", 0)
-        migrated["placements"].append(new_p)
-
-    # Road network
-    if "road_network" in contract:
-        migrated["road_network"] = contract["road_network"]
-    elif "roads" in contract:
-        migrated["road_network"] = {"segments": contract["roads"]}
-
-    # Metrics
-    if "metrics" in contract:
-        migrated["metrics"] = contract["metrics"]
-
-    # Provenance
-    if "provenance" in contract:
-        migrated["provenance"] = contract["provenance"]
-    else:
-        migrated["provenance"] = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "solver_version": "unknown",
-        }
-
-    return migrated
+    raise ValueError(
+        f"No migration path from version '{from_version}'. "
+        f"Supported: {SUPPORTED_CONTRACT_VERSIONS}. Re-export from site-fit "
+        f"(sitefit_export_contract)."
+    )
 
 
 def register_contract_tools(mcp, get_freecad_connection, add_screenshot_if_available):
@@ -739,8 +679,10 @@ for p in placements:
         errors.append(f"Object '{{obj_id}}' not found")
         continue
 
-    # Get current Z position to preserve elevation
-    current_z = obj.Placement.Base.z
+    # Z: use the contract FFE when provided (terrain-aware v2 contracts),
+    # otherwise preserve the object's current elevation
+    ffe_m = p.get("ffe_m")
+    current_z = ffe_m * M_TO_MM if ffe_m is not None else obj.Placement.Base.z
 
     # For Part::Box (rectangular equipment), dimensions are pre-swapped during creation
     # based on rotation_deg, so we use simple center-to-corner offset (no FreeCAD rotation)
@@ -1727,7 +1669,9 @@ for p in placements:
         not_found.append(obj_id)
         continue
 
-    current_z = obj.Placement.Base.z
+    # Z: contract FFE wins when provided (terrain-aware v2 contracts)
+    ffe_m = p.get("ffe_m")
+    current_z = ffe_m * M_TO_MM if ffe_m is not None else obj.Placement.Base.z
 
     # Create rotation around Z axis
     rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), rotation_deg)
@@ -2070,6 +2014,9 @@ print("layer_ok")
                     rotation_deg = placement.get("rotation_deg", 0) if placement else 0
                     x_mm = x_m * M_TO_MM
                     y_mm = y_m * M_TO_MM
+                    # Terrain-aware v2 contracts carry FFE per placement
+                    ffe_m = placement.get("ffe_m") if placement else None
+                    z_mm = ffe_m * M_TO_MM if ffe_m is not None else 0
 
                     # Unique object name for this layer
                     obj_name = f"{struct_id.replace('-', '_')}_L{idx + 1}"
@@ -2089,7 +2036,7 @@ cyl = doc.addObject("Part::Cylinder", "{obj_name}")
 cyl.Radius = {radius_mm}
 cyl.Height = {height_mm}
 cyl.Label = "{struct_id}"
-cyl.Placement = FreeCAD.Placement(FreeCAD.Vector({x_mm}, {y_mm}, 0), FreeCAD.Rotation())
+cyl.Placement = FreeCAD.Placement(FreeCAD.Vector({x_mm}, {y_mm}, {z_mm}), FreeCAD.Rotation())
 equip_group.addObject(cyl)
 doc.recompute()
 '''
@@ -2123,7 +2070,7 @@ box.Width = {width_mm}
 box.Length = {length_mm}
 box.Height = {height_mm}
 box.Label = "{struct_id}"
-box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x}, {corner_y}, 0), FreeCAD.Rotation())
+box.Placement = FreeCAD.Placement(FreeCAD.Vector({corner_x}, {corner_y}, {z_mm}), FreeCAD.Rotation())
 equip_group.addObject(box)
 doc.recompute()
 '''

@@ -18,7 +18,7 @@ import json
 from typing import Any, Literal
 
 import structlog
-from mcp.server.fastmcp import Context
+from fastmcp import Context
 from mcp.types import TextContent, ImageContent
 
 from .path_utils import wsl_to_windows_path
