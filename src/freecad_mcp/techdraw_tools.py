@@ -65,6 +65,10 @@ def register_techdraw_tools(
         project_name: str = "",
         drawing_number: str = "",
         revision: str = "A",
+        status: str = "",
+        drawn_by: str = "",
+        checked_by: str = "",
+        approved_by: str = "",
         include_labels: bool = True,
         export_pdf_path: str | None = None,
         export_dxf_path: str | None = None,
@@ -86,6 +90,13 @@ def register_techdraw_tools(
             project_name: Project name for title block
             drawing_number: Drawing number for title block (e.g., "100-GA-001")
             revision: Revision letter/number for title block (default: "A")
+            status: Drawing status stamp (e.g. "NOT FOR CONSTRUCTION",
+                    "FOR APPROVAL"). Written to a template STATUS field if one
+                    exists, otherwise rendered as a red annotation stamp so the
+                    status is always visible on the sheet.
+            drawn_by: Title block DRAWN BY field
+            checked_by: Title block CHECKED BY field
+            approved_by: Title block APPROVED BY field
             include_labels: Whether to add equipment ID labels (default: True)
             export_pdf_path: Optional path to export PDF file
             export_dxf_path: Optional path to export DXF file
@@ -241,6 +252,16 @@ else:
                 "FC:Date": "{current_date}",
                 "SCALE": "{scale}",
                 "FC:Scale": "{scale}",
+                "STATUS": "{status}",
+                "FC:Status": "{status}",
+                "DRAWING_STATUS": "{status}",
+                "DRAWN_BY": "{drawn_by}",
+                "FC:DrawnBy": "{drawn_by}",
+                "AUTHOR_NAME": "{drawn_by}",
+                "CHECKED_BY": "{checked_by}",
+                "FC:CheckedBy": "{checked_by}",
+                "APPROVED_BY": "{approved_by}",
+                "FC:ApprovedBy": "{approved_by}",
             }}
             for field, value in field_mapping.items():
                 if field in texts and value:
@@ -248,6 +269,31 @@ else:
             template_obj.EditableTexts = texts
     except Exception as e:
         print(f"Warning: Could not set title block fields: {{e}}")
+
+# Status stamp must be visible even when the template has no STATUS field:
+# fall back to a red annotation across the top of the sheet.
+status_text = "{status}"
+if status_text:
+    _stamped_in_template = False
+    try:
+        if template_path is not None and hasattr(template_obj, "EditableTexts"):
+            _stamped_in_template = any(
+                f in template_obj.EditableTexts and template_obj.EditableTexts[f] == status_text
+                for f in ("STATUS", "FC:Status", "DRAWING_STATUS")
+            )
+    except Exception:
+        pass
+    if not _stamped_in_template:
+        _page_w = {TEMPLATE_SIZES[template]["width"]}
+        _page_h = {TEMPLATE_SIZES[template]["height"]}
+        stamp = doc.addObject("TechDraw::DrawViewAnnotation", "{page_name}_StatusStamp")
+        stamp.Text = [status_text]
+        stamp.TextSize = 7.0
+        if hasattr(stamp, "TextColor"):
+            stamp.TextColor = (0.80, 0.00, 0.00)
+        page.addView(stamp)
+        stamp.X = _page_w / 2
+        stamp.Y = _page_h - 12
 
 # Collect visible objects with shapes for the view (including compound sub-objects)
 def collect_objects_with_shapes(objects, collected=None):
@@ -978,5 +1024,390 @@ print(repr(result))
         except Exception as e:
             logger.error("export_techdraw_page_failed", doc_name=doc_name, page_name=page_name, error=str(e))
             return [TextContent(type="text", text=f"Failed to export TechDraw page: {e}")]
+
+    @mcp.tool()
+    def add_techdraw_view(
+        ctx: Context,
+        doc_name: str,
+        page_name: str,
+        view_name: str,
+        view_type: str = "orthographic",
+        direction: str = "Front",
+        base_view_name: str | None = None,
+        section_normal: list[float] | None = None,
+        section_origin: list[float] | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        scale: float | None = None,
+        caption: str = "",
+        source_object_names: list[str] | None = None,
+    ) -> list[TextContent]:
+        """Add an orthographic elevation or a section view to an existing TechDraw page.
+
+        view_type "orthographic": projects the model along a preset direction —
+        one of Front (-Y), Rear (+Y), Right (-X), Left (+X), Top (-Z), Bottom (+Z).
+        view_type "section": cuts an existing view (base_view_name) with a plane
+        defined by section_normal + section_origin (model coordinates) and
+        projects the cut — use for container cross-sections.
+
+        Args:
+            doc_name: FreeCAD document name
+            page_name: Existing TechDraw page to add the view to
+            view_name: Name for the new view object
+            view_type: "orthographic" or "section"
+            direction: Preset projection for orthographic views
+            base_view_name: (section) existing view to cut
+            section_normal: (section) cut-plane normal [x,y,z] in model coords
+            section_origin: (section) point on the cut plane [x,y,z]
+            x, y: View position on the page (mm); defaults to page center
+            scale: View scale (float, e.g. 0.05 for 1:20); defaults to the base
+                   view's scale (section) or the page's first view's scale
+            caption: Optional caption below the view (e.g. "SECTION A-A")
+            source_object_names: Restrict the projected objects (default: all
+                                 visible objects with shapes)
+        """
+        freecad = get_freecad_connection()
+
+        directions = {
+            "Front": ((0, -1, 0), (1, 0, 0)),
+            "Rear": ((0, 1, 0), (-1, 0, 0)),
+            "Right": ((-1, 0, 0), (0, -1, 0)),
+            "Left": ((1, 0, 0), (0, 1, 0)),
+            "Top": ((0, 0, -1), (1, 0, 0)),
+            "Bottom": ((0, 0, 1), (1, 0, 0)),
+        }
+        if view_type == "orthographic" and direction not in directions:
+            return [TextContent(type="text", text=f"Invalid direction '{direction}'. Options: {', '.join(directions)}")]
+        if view_type == "section" and (not base_view_name or not section_normal or not section_origin):
+            return [TextContent(type="text", text="Section views require base_view_name, section_normal, and section_origin")]
+        if view_type not in ("orthographic", "section"):
+            return [TextContent(type="text", text=f"Invalid view_type '{view_type}' (orthographic|section)")]
+
+        dir_vec, xdir_vec = directions.get(direction, ((0, -1, 0), (1, 0, 0)))
+        code = f'''
+import FreeCAD
+import TechDraw
+
+doc = FreeCAD.getDocument("{doc_name}")
+if doc is None:
+    raise ValueError("Document '{doc_name}' not found")
+page = doc.getObject("{page_name}")
+if page is None or not page.TypeId.startswith("TechDraw::DrawPage"):
+    raise ValueError("TechDraw page '{page_name}' not found")
+
+existing = doc.getObject("{view_name}")
+if existing:
+    doc.removeObject("{view_name}")
+
+view_type = "{view_type}"
+source_names = {source_object_names!r}
+
+def _visible_shape_objects():
+    objs = []
+    for obj in doc.Objects:
+        if obj.TypeId.startswith("TechDraw::"):
+            continue
+        if hasattr(obj, "ViewObject") and hasattr(obj.ViewObject, "Visibility") and not obj.ViewObject.Visibility:
+            continue
+        if hasattr(obj, "Shape") and obj.Shape:
+            objs.append(obj)
+    return objs
+
+if view_type == "orthographic":
+    if source_names:
+        sources = [doc.getObject(n) for n in source_names]
+        missing = [n for n, o in zip(source_names, sources) if o is None]
+        if missing:
+            raise ValueError(f"Source objects not found: {{missing}}")
+    else:
+        sources = _visible_shape_objects()
+    if not sources:
+        raise ValueError("No visible objects with shapes to project")
+    view = doc.addObject("TechDraw::DrawViewPart", "{view_name}")
+    view.Source = sources
+    view.Direction = FreeCAD.Vector({dir_vec[0]}, {dir_vec[1]}, {dir_vec[2]})
+    view.XDirection = FreeCAD.Vector({xdir_vec[0]}, {xdir_vec[1]}, {xdir_vec[2]})
+else:
+    base = doc.getObject("{base_view_name or ''}")
+    if base is None:
+        raise ValueError("Base view '{base_view_name}' not found")
+    sn = {section_normal!r}
+    so = {section_origin!r}
+    view = doc.addObject("TechDraw::DrawViewSection", "{view_name}")
+    view.BaseView = base
+    view.Source = base.Source
+    view.SectionNormal = FreeCAD.Vector(sn[0], sn[1], sn[2])
+    view.SectionOrigin = FreeCAD.Vector(so[0], so[1], so[2])
+    # DrawViewSection derives its projection from SectionNormal + BaseView;
+    # do not override Direction or the cut and projection can disagree.
+    if hasattr(view, "FuseBeforeCut"):
+        view.FuseBeforeCut = True
+
+scale = {scale!r}
+if scale is None:
+    if view_type == "section":
+        scale = float(doc.getObject("{base_view_name or ''}").Scale)
+    else:
+        page_views = [v for v in page.Views if hasattr(v, "Scale")]
+        scale = float(page_views[0].Scale) if page_views else 0.05
+view.ScaleType = "Custom"
+view.Scale = scale
+
+page.addView(view)
+page_w = page.Template.Width.Value if page.Template else 841
+page_h = page.Template.Height.Value if page.Template else 594
+view.X = {x!r} if {x!r} is not None else page_w / 2
+view.Y = {y!r} if {y!r} is not None else page_h / 2
+
+caption = "{caption}"
+if caption:
+    cap = doc.addObject("TechDraw::DrawViewAnnotation", "{view_name}_Caption")
+    cap.Text = [caption]
+    cap.TextSize = 5.0
+    page.addView(cap)
+    cap.X = view.X
+    cap.Y = max(10.0, float(view.Y) - 12.0)
+
+doc.recompute()
+print(f"View '{{view.Name}}' ({{view.TypeId}}) added to '{{page.Name}}' at scale {{float(view.Scale):.5f}}")
+'''
+        try:
+            res = freecad.execute_code(code)
+            if res.get("success"):
+                return [TextContent(type="text", text=res.get("message", "View added"))]
+            return [TextContent(type="text", text=f"Failed to add view: {res.get('error', 'Unknown error')}")]
+        except Exception as e:
+            logger.error("add_techdraw_view_failed", error=str(e))
+            return [TextContent(type="text", text=f"Failed to add view: {e}")]
+
+    @mcp.tool()
+    def get_techdraw_view_topology(
+        ctx: Context,
+        doc_name: str,
+        page_name: str,
+        view_name: str,
+        max_items: int = 120,
+    ) -> list[TextContent]:
+        """List a TechDraw view's projected vertices and edges with 2D coordinates.
+
+        Associative dimensions reference view subelements ("Vertex3", "Edge7").
+        Call this first, pick the references by coordinate, then call
+        add_techdraw_dimension. Coordinates are in view space (mm on the page,
+        relative to the view center, at view scale).
+        """
+        freecad = get_freecad_connection()
+        code = f'''
+import FreeCAD
+
+doc = FreeCAD.getDocument("{doc_name}")
+if doc is None:
+    raise ValueError("Document '{doc_name}' not found")
+view = doc.getObject("{view_name}")
+if view is None:
+    raise ValueError("View '{view_name}' not found")
+
+lines = []
+n_v = 0
+n_e = 0
+try:
+    verts = view.getVisibleVertexes() if hasattr(view, "getVisibleVertexes") else []
+    for i, v in enumerate(verts[: {max_items}]):
+        pt = v.Point if hasattr(v, "Point") else v
+        lines.append(f"Vertex{{i}}: ({{float(pt.x):.2f}}, {{float(pt.y):.2f}})")
+        n_v += 1
+except Exception as e:
+    lines.append(f"(vertex listing failed: {{e}})")
+try:
+    edges = view.getVisibleEdges() if hasattr(view, "getVisibleEdges") else []
+    for i, e in enumerate(edges[: {max_items}]):
+        try:
+            c = e.Curve.__class__.__name__
+            p1 = e.Vertexes[0].Point
+            p2 = e.Vertexes[-1].Point
+            lines.append(f"Edge{{i}}: {{c}} ({{float(p1.x):.2f}}, {{float(p1.y):.2f}}) -> ({{float(p2.x):.2f}}, {{float(p2.y):.2f}}) len={{float(e.Length):.2f}}")
+        except Exception:
+            lines.append(f"Edge{{i}}: (unreadable)")
+        n_e += 1
+except Exception as e:
+    lines.append(f"(edge listing failed: {{e}})")
+
+print(f"View '{view_name}': {{n_v}} vertices, {{n_e}} edges (view-space mm)\\n" + "\\n".join(lines))
+'''
+        try:
+            res = freecad.execute_code(code)
+            if res.get("success"):
+                return [TextContent(type="text", text=res.get("message", ""))]
+            return [TextContent(type="text", text=f"Failed to read topology: {res.get('error', 'Unknown error')}")]
+        except Exception as e:
+            logger.error("get_techdraw_view_topology_failed", error=str(e))
+            return [TextContent(type="text", text=f"Failed to read topology: {e}")]
+
+    @mcp.tool()
+    def add_techdraw_dimension(
+        ctx: Context,
+        doc_name: str,
+        page_name: str,
+        view_name: str,
+        dim_type: str,
+        references: list[str],
+        dim_name: str | None = None,
+        x: float | None = None,
+        y: float | None = None,
+        format_spec: str | None = None,
+    ) -> list[TextContent]:
+        """Add an associative TechDraw dimension to a view.
+
+        The dimension reads the projected geometry — it updates when the model
+        changes, unlike an annotation. Use get_techdraw_view_topology to find
+        the subelement references.
+
+        Args:
+            doc_name: FreeCAD document name
+            page_name: TechDraw page name
+            view_name: View carrying the referenced geometry
+            dim_type: Distance | DistanceX | DistanceY | Diameter | Radius | Angle
+            references: Subelement names on the view, e.g. ["Edge5"] for an
+                        edge length, ["Vertex2", "Vertex7"] for point-to-point
+            dim_name: Optional object name (auto if omitted)
+            x, y: Dimension text position in view space (mm, relative to view
+                  center); defaults to near the referenced geometry
+            format_spec: Optional value format override, e.g. "%.2f in" —
+                        prefix/suffix text is preserved, %.Nf formats the value
+        """
+        freecad = get_freecad_connection()
+        valid_types = ("Distance", "DistanceX", "DistanceY", "Diameter", "Radius", "Angle")
+        if dim_type not in valid_types:
+            return [TextContent(type="text", text=f"Invalid dim_type '{dim_type}'. Options: {', '.join(valid_types)}")]
+        if not references:
+            return [TextContent(type="text", text="At least one subelement reference is required")]
+
+        code = f'''
+import FreeCAD
+
+doc = FreeCAD.getDocument("{doc_name}")
+if doc is None:
+    raise ValueError("Document '{doc_name}' not found")
+page = doc.getObject("{page_name}")
+if page is None:
+    raise ValueError("Page '{page_name}' not found")
+view = doc.getObject("{view_name}")
+if view is None:
+    raise ValueError("View '{view_name}' not found")
+
+dim = doc.addObject("TechDraw::DrawViewDimension", {dim_name!r} or "Dim_{view_name}")
+dim.Type = "{dim_type}"
+dim.References2D = [(view, ref) for ref in {references!r}]
+if {format_spec!r}:
+    dim.FormatSpec = {format_spec!r}
+    if hasattr(dim, "Arbitrary"):
+        dim.Arbitrary = False
+page.addView(dim)
+if {x!r} is not None:
+    dim.X = {x!r}
+if {y!r} is not None:
+    dim.Y = {y!r}
+doc.recompute()
+
+raw = None
+try:
+    raw = float(dim.getRawValue()) if hasattr(dim, "getRawValue") else None
+except Exception:
+    pass
+print(f"Dimension '{{dim.Name}}' ({{dim.Type}}) on '{{view.Name}}' refs={references!r}" + (f" raw={{raw:.3f}}mm" if raw is not None else ""))
+'''
+        try:
+            res = freecad.execute_code(code)
+            if res.get("success"):
+                return [TextContent(type="text", text=res.get("message", "Dimension added"))]
+            return [TextContent(type="text", text=f"Failed to add dimension: {res.get('error', 'Unknown error')}")]
+        except Exception as e:
+            logger.error("add_techdraw_dimension_failed", error=str(e))
+            return [TextContent(type="text", text=f"Failed to add dimension: {e}")]
+
+    @mcp.tool()
+    def validate_techdraw_page(
+        ctx: Context,
+        doc_name: str,
+        page_name: str,
+    ) -> list[TextContent]:
+        """Validate a TechDraw page before export: template + title block fields
+        present, views have sources, dimensions resolve, status stamp visible.
+
+        Returns a structured pass/fail report — the 'validate' step of the
+        typed TechDraw pipeline (run before export_techdraw_page).
+        """
+        freecad = get_freecad_connection()
+        code = f'''
+import FreeCAD
+
+doc = FreeCAD.getDocument("{doc_name}")
+if doc is None:
+    raise ValueError("Document '{doc_name}' not found")
+page = doc.getObject("{page_name}")
+if page is None or not page.TypeId.startswith("TechDraw::DrawPage"):
+    raise ValueError("TechDraw page '{page_name}' not found")
+
+problems = []
+info = []
+
+if page.Template is None:
+    problems.append("No template attached")
+else:
+    texts = dict(page.Template.EditableTexts) if hasattr(page.Template, "EditableTexts") else {{}}
+    filled = {{k: v for k, v in texts.items() if v and v not in ("-", "DEFAULT")}}
+    info.append(f"Title block: {{len(filled)}}/{{len(texts)}} editable fields filled")
+    for key in ("DWG_NO", "FC:DrawingNumber", "DRAWING_NUMBER"):
+        if key in texts and texts[key] and texts[key] != "DEFAULT":
+            break
+    else:
+        problems.append("Drawing number not set in title block")
+
+views = [v for v in page.Views]
+part_views = [v for v in views if v.TypeId in ("TechDraw::DrawViewPart", "TechDraw::DrawViewSection")]
+dims = [v for v in views if v.TypeId == "TechDraw::DrawViewDimension"]
+annos = [v for v in views if v.TypeId == "TechDraw::DrawViewAnnotation"]
+balloons = [v for v in views if v.TypeId == "TechDraw::DrawViewBalloon"]
+
+info.append(f"Views: {{len(part_views)}} part/section, {{len(dims)}} dimensions, {{len(balloons)}} balloons, {{len(annos)}} annotations")
+
+if not part_views:
+    problems.append("Page has no part or section views")
+scales = set()
+for v in part_views:
+    if not v.Source:
+        problems.append(f"View '{{v.Name}}' has no Source objects")
+    scales.add(round(float(v.Scale), 6))
+if len(scales) > 2:
+    info.append(f"Note: {{len(scales)}} distinct view scales on one sheet: {{sorted(scales)}}")
+
+for d in dims:
+    try:
+        raw = float(d.getRawValue()) if hasattr(d, "getRawValue") else None
+        if raw is not None and raw == 0.0:
+            problems.append(f"Dimension '{{d.Name}}' resolves to 0 — dangling reference?")
+    except Exception as e:
+        problems.append(f"Dimension '{{d.Name}}' failed to resolve: {{e}}")
+
+has_stamp = any("statusstamp" in v.Name.lower() for v in annos)
+if page.Template is not None and hasattr(page.Template, "EditableTexts"):
+    t = dict(page.Template.EditableTexts)
+    has_stamp = has_stamp or any(t.get(k) for k in ("STATUS", "FC:Status", "DRAWING_STATUS"))
+if not has_stamp:
+    problems.append("No status stamp (template STATUS field or StatusStamp annotation)")
+
+verdict = "PASS" if not problems else "FAIL"
+report = [f"validate_techdraw_page: {{verdict}}"]
+report += [f"  [info] {{line}}" for line in info]
+report += [f"  [problem] {{p}}" for p in problems]
+print("\\n".join(report))
+'''
+        try:
+            res = freecad.execute_code(code)
+            if res.get("success"):
+                return [TextContent(type="text", text=res.get("message", ""))]
+            return [TextContent(type="text", text=f"Validation failed to run: {res.get('error', 'Unknown error')}")]
+        except Exception as e:
+            logger.error("validate_techdraw_page_failed", error=str(e))
+            return [TextContent(type="text", text=f"Validation failed to run: {e}")]
 
     logger.info("techdraw_tools_registered")
