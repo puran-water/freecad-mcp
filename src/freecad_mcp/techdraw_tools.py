@@ -1356,10 +1356,9 @@ else:
     texts = dict(page.Template.EditableTexts) if hasattr(page.Template, "EditableTexts") else {{}}
     filled = {{k: v for k, v in texts.items() if v and v not in ("-", "DEFAULT")}}
     info.append(f"Title block: {{len(filled)}}/{{len(texts)}} editable fields filled")
-    for key in ("DWG_NO", "FC:DrawingNumber", "DRAWING_NUMBER"):
-        if key in texts and texts[key] and texts[key] != "DEFAULT":
-            break
-    else:
+    _dn_keys = [k for k in texts if "drawing" in k.lower() and ("no" in k.lower() or "number" in k.lower())]
+    _dn_keys += [k for k in ("DWG_NO", "FC:DrawingNumber", "DN") if k in texts]
+    if not any(texts[k] and texts[k] != "DEFAULT" for k in _dn_keys):
         problems.append("Drawing number not set in title block")
 
 views = [v for v in page.Views]

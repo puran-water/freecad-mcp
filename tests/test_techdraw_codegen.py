@@ -131,3 +131,22 @@ def test_validate_page_generates_valid_code():
     res = fns["validate_techdraw_page"](ctx=None, doc_name="D", page_name="P")
     assert "ok" in res[0].text
     assert "validate_techdraw_page" in conn.codes[-1]
+
+
+def test_windows_backslash_path_generates_valid_code():
+    """C:\\Users\\... embedded in generated code must not raise a unicode-escape
+    SyntaxError (path_utils normalizes to forward slashes)."""
+    conn, fns = _make_tools()
+    res = fns["export_techdraw_page"](
+        ctx=None, doc_name="D", page_name="P",
+        export_pdf_path="C:\\Users\\hvksh\\Documents\\out.pdf",
+    )
+    assert conn.codes, "no code generated"
+    assert "C:/Users/hvksh/Documents/out.pdf" in conn.codes[-1]
+
+
+def test_validator_accepts_iso5457_lowercase_drawing_number():
+    conn, fns = _make_tools()
+    fns["validate_techdraw_page"](ctx=None, doc_name="D", page_name="P")
+    code = conn.codes[-1]
+    assert "drawing" in code and "lower()" in code
