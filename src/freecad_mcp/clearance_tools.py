@@ -145,6 +145,7 @@ print(f"{{gh_name}} [{kind}]: x {{bb.XMin/IN:.1f}}..{{bb.XMax/IN:.1f}}, y {{bb.Y
         solid_prefixes: list[str],
         allow_pairs: list[list[str]] | None = None,
         min_volume_in3: float = 1.0,
+        max_faces: int = 2000,
     ) -> list[TextContent]:
         """Boolean-check every ``GH_*`` envelope against every real solid.
 
@@ -184,13 +185,25 @@ for o in doc.Objects:
 
 report = []
 fails = 0
+MAX_FACES = {max_faces}
 for ename, esh in sorted(envs.items()):
     rows_fail = []
     rows_info = []
     for sname, ssh in sorted(solids.items()):
+        # bbox prefilter: cheap reject before any boolean (heavy-compound lesson)
+        if not esh.BoundBox.intersected(ssh.BoundBox).isValid():
+            continue
+        # complexity guard: booleans/vertex sweeps on huge vendor compounds
+        # exceed the GUI dispatch budget (observed: 62 MB STEP, >300 s) —
+        # fail closed as UNEVALUATED instead of grinding or skipping
+        if len(ssh.Faces) > MAX_FACES:
+            rows_fail.append(f"    {{sname}}: UNEVALUATED (complexity guard: {{len(ssh.Faces)}} faces > {{MAX_FACES}}; gate a decimated proxy or sub-solids)")
+            continue
         try:
             c = esh.common(ssh)
-        except Exception:
+        except Exception as bex:
+            # fail closed: a boolean failure is not a pass (codex finding 6)
+            rows_fail.append(f"    {{sname}}: UNEVALUATED (boolean failed: {{bex}})")
             continue
         if c.Volume < minv:
             continue

@@ -178,5 +178,8 @@ def test_clearance_tools_generate_valid_code():
                                 allow_pairs=[["HoseExtract_P1", "PIPE_"]])
     assert "ok" in res[0].text
     assert "CLEARANCE GATE" in conn.codes[-1]
+    assert "UNEVALUATED" in conn.codes[-1]          # fail-closed boolean failures
+    assert "complexity guard" in conn.codes[-1]      # heavy-compound guard
+    assert "BoundBox.intersected" in conn.codes[-1]  # bbox prefilter
     res = fns["clearance_gate"](ctx=None, doc_name="D", solid_prefixes=[])
     assert "non-empty" in res[0].text
