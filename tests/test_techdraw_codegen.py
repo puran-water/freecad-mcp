@@ -150,3 +150,33 @@ def test_validator_accepts_iso5457_lowercase_drawing_number():
     fns["validate_techdraw_page"](ctx=None, doc_name="D", page_name="P")
     code = conn.codes[-1]
     assert "drawing" in code and "lower()" in code
+
+
+def test_clearance_tools_generate_valid_code():
+    from fastmcp import FastMCP
+    import freecad_mcp.clearance_tools as ct
+    import asyncio
+    mcp = FastMCP("t2"); conn = FakeConn()
+    ct.register_clearance_tools(mcp, lambda: conn, lambda r, s, i: r)
+    result = mcp.list_tools()
+    tools = asyncio.run(result) if asyncio.iscoroutine(result) else result
+    fns = {t.name: t.fn for t in (tools if not isinstance(tools, dict) else tools.values())}
+    for kind, params in [
+        ("box", dict(x=0, y=0, z=0, dx=100, dy=100, dz=100)),
+        ("cylinder", dict(p1=[0, 0, 0], axis=[1, 0, 0], radius=50, length=100)),
+        ("swing_arc", dict(hinge=[100, 200, 0], radius=1219, start_deg=90, sweep_deg=180, z0=0, z1=1600)),
+        ("nec_110_26", dict(face_x=100, face_y=200, width=914, facing=[0, -1], condition=2)),
+        ("egress", dict(x0=50, y0=200, length=11000, axis=[1, 0])),
+    ]:
+        res = fns["clearance_declare"](ctx=None, doc_name="D", name=f"t_{kind}", kind=kind, params=params)
+        assert "ok" in res[0].text, (kind, res[0].text)
+    res = fns["clearance_declare"](ctx=None, doc_name="D", name="bad", kind="sphere", params={})
+    assert "Invalid kind" in res[0].text
+    res = fns["clearance_declare"](ctx=None, doc_name="D", name="bad2", kind="box", params={"x": 0})
+    assert "missing params" in res[0].text
+    res = fns["clearance_gate"](ctx=None, doc_name="D", solid_prefixes=["CSW_", "PUMP"],
+                                allow_pairs=[["HoseExtract_P1", "PIPE_"]])
+    assert "ok" in res[0].text
+    assert "CLEARANCE GATE" in conn.codes[-1]
+    res = fns["clearance_gate"](ctx=None, doc_name="D", solid_prefixes=[])
+    assert "non-empty" in res[0].text

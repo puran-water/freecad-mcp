@@ -795,6 +795,10 @@ register_contract_tools(mcp, get_freecad_connection, add_screenshot_if_available
 # Register TechDraw plan sheet tools
 register_techdraw_tools(mcp, get_freecad_connection, add_screenshot_if_available)
 
+# Register clearance envelope + gate tools
+from .clearance_tools import register_clearance_tools
+register_clearance_tools(mcp, get_freecad_connection, add_screenshot_if_available)
+
 # Register CSA (Control System Architecture) diagram tools
 register_csa_tools(mcp, get_freecad_connection, add_screenshot_if_available)
 
