@@ -3,7 +3,6 @@ import FreeCADGui
 import ObjectsFem
 
 import contextlib
-import queue
 import base64
 import io
 import os
@@ -15,23 +14,22 @@ from xmlrpc.server import SimpleXMLRPCServer
 
 from PySide import QtCore
 
+from .gui_dispatch import dispatch_to_gui, drain_pending
 from .parts_library import get_parts_list, insert_part_from_library
 from .serialize import serialize_object
 
 rpc_server_thread = None
 rpc_server_instance = None
+_stop_thread = None  # drains shutdown off the GUI thread; see stop_rpc_server
 
-# GUI task queue
-rpc_request_queue = queue.Queue()
-rpc_response_queue = queue.Queue()
+# Long-running work (TechDraw exports, imports, heavy recomputes) gets a
+# larger budget than simple document edits.
+EXECUTE_CODE_TIMEOUT = 300.0
+SCREENSHOT_TIMEOUT = 120.0
 
 
 def process_gui_tasks():
-    while not rpc_request_queue.empty():
-        task = rpc_request_queue.get()
-        res = task()
-        if res is not None:
-            rpc_response_queue.put(res)
+    drain_pending()
     QtCore.QTimer.singleShot(500, process_gui_tasks)
 
 
@@ -121,6 +119,16 @@ def set_object_property(
             FreeCAD.Console.PrintError(f"Property '{prop}' assignment error: {e}\n")
 
 
+def _ok(res) -> bool:
+    return isinstance(res, dict) and res.get("ok") is True
+
+
+def _error_of(res) -> str:
+    if isinstance(res, dict):
+        return str(res.get("error", res))
+    return str(res)
+
+
 class FreeCADRPC:
     """RPC server for FreeCAD"""
 
@@ -128,12 +136,10 @@ class FreeCADRPC:
         return True
 
     def create_document(self, name="New_Document"):
-        rpc_request_queue.put(lambda: self._create_document_gui(name))
-        res = rpc_response_queue.get()
-        if res is True:
-            return {"success": True, "document_name": name}
-        else:
-            return {"success": False, "error": res}
+        res = dispatch_to_gui(lambda: self._create_document_gui(name))
+        if _ok(res):
+            return {"success": True, "document_name": res["document_name"]}
+        return {"success": False, "error": _error_of(res)}
 
     def create_object(self, doc_name, obj_data: dict[str, Any]):
         obj = Object(
@@ -142,32 +148,26 @@ class FreeCADRPC:
             analysis=obj_data.get("Analysis", None),
             properties=obj_data.get("Properties", {}),
         )
-        rpc_request_queue.put(lambda: self._create_object_gui(doc_name, obj))
-        res = rpc_response_queue.get()
-        if res is True:
-            return {"success": True, "object_name": obj.name}
-        else:
-            return {"success": False, "error": res}
+        res = dispatch_to_gui(lambda: self._create_object_gui(doc_name, obj))
+        if _ok(res):
+            return {"success": True, "object_name": res["object_name"]}
+        return {"success": False, "error": _error_of(res)}
 
     def edit_object(self, doc_name: str, obj_name: str, properties: dict[str, Any]) -> dict[str, Any]:
         obj = Object(
             name=obj_name,
             properties=properties.get("Properties", {}),
         )
-        rpc_request_queue.put(lambda: self._edit_object_gui(doc_name, obj))
-        res = rpc_response_queue.get()
+        res = dispatch_to_gui(lambda: self._edit_object_gui(doc_name, obj))
         if res is True:
             return {"success": True, "object_name": obj.name}
-        else:
-            return {"success": False, "error": res}
+        return {"success": False, "error": _error_of(res)}
 
     def delete_object(self, doc_name: str, obj_name: str):
-        rpc_request_queue.put(lambda: self._delete_object_gui(doc_name, obj_name))
-        res = rpc_response_queue.get()
+        res = dispatch_to_gui(lambda: self._delete_object_gui(doc_name, obj_name))
         if res is True:
             return {"success": True, "object_name": obj_name}
-        else:
-            return {"success": False, "error": res}
+        return {"success": False, "error": _error_of(res)}
 
     def execute_code(self, code: str) -> dict[str, Any]:
         output_buffer = io.StringIO()
@@ -183,15 +183,13 @@ class FreeCADRPC:
                 )
                 return f"Error executing Python code: {e}\n"
 
-        rpc_request_queue.put(task)
-        res = rpc_response_queue.get()
+        res = dispatch_to_gui(task, timeout=EXECUTE_CODE_TIMEOUT)
         if res is True:
             return {
                 "success": True,
                 "message": "Python code execution scheduled. \nOutput: " + output_buffer.getvalue()
             }
-        else:
-            return {"success": False, "error": res}
+        return {"success": False, "error": _error_of(res)}
 
     def get_objects(self, doc_name):
         doc = FreeCAD.getDocument(doc_name)
@@ -208,12 +206,10 @@ class FreeCADRPC:
             return None
 
     def insert_part_from_library(self, relative_path):
-        rpc_request_queue.put(lambda: self._insert_part_from_library(relative_path))
-        res = rpc_response_queue.get()
+        res = dispatch_to_gui(lambda: self._insert_part_from_library(relative_path))
         if res is True:
             return {"success": True, "message": "Part inserted from library."}
-        else:
-            return {"success": False, "error": res}
+        return {"success": False, "error": _error_of(res)}
 
     def list_documents(self):
         return list(FreeCAD.listDocuments().keys())
@@ -223,7 +219,7 @@ class FreeCADRPC:
 
     def get_active_screenshot(self, view_name: str = "Isometric") -> str:
         """Get a screenshot of the active view.
-        
+
         Returns a base64-encoded string of the screenshot or None if a screenshot
         cannot be captured (e.g., when in TechDraw or Spreadsheet view).
         """
@@ -234,7 +230,7 @@ class FreeCADRPC:
                 if active_view is None:
                     FreeCAD.Console.PrintWarning("No active view available\n")
                     return False
-                
+
                 view_type = type(active_view).__name__
                 has_save_image = hasattr(active_view, 'saveImage')
                 FreeCAD.Console.PrintMessage(f"View type: {view_type}, Has saveImage: {has_save_image}\n")
@@ -242,21 +238,22 @@ class FreeCADRPC:
             except Exception as e:
                 FreeCAD.Console.PrintError(f"Error checking view capabilities: {e}\n")
                 return False
-                
-        rpc_request_queue.put(check_view_supports_screenshots)
-        supports_screenshots = rpc_response_queue.get()
-        
-        if not supports_screenshots:
+
+        supports_screenshots = dispatch_to_gui(check_view_supports_screenshots)
+
+        # A timeout returns an error string (truthy) — only literal True means
+        # the view can be captured.
+        if supports_screenshots is not True:
             FreeCAD.Console.PrintWarning("Current view does not support screenshots\n")
             return None
-            
+
         # If view supports screenshots, proceed with capture
         fd, tmp_path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
-        rpc_request_queue.put(
-            lambda: self._save_active_screenshot(tmp_path, view_name)
+        res = dispatch_to_gui(
+            lambda: self._save_active_screenshot(tmp_path, view_name),
+            timeout=SCREENSHOT_TIMEOUT,
         )
-        res = rpc_response_queue.get()
         if res is True:
             try:
                 with open(tmp_path, "rb") as image_file:
@@ -273,10 +270,13 @@ class FreeCADRPC:
             return None
 
     def _create_document_gui(self, name):
+        # FreeCAD sanitises requested names ('My Doc' -> 'My_Doc'); report the
+        # actual Document.Name or every follow-up call targets a nonexistent
+        # document (upstream #91, 71b7db2).
         doc = FreeCAD.newDocument(name)
         doc.recompute()
-        FreeCAD.Console.PrintMessage(f"Document '{name}' created via RPC.\n")
-        return True
+        FreeCAD.Console.PrintMessage(f"Document '{doc.Name}' created via RPC.\n")
+        return {"ok": True, "document_name": doc.Name}
 
     def _create_object_gui(self, doc_name, obj: Object):
         doc = FreeCAD.getDocument(doc_name)
@@ -284,11 +284,11 @@ class FreeCADRPC:
             try:
                 if obj.type == "Fem::FemMeshGmsh" and obj.analysis:
                     from femmesh.gmshtools import GmshTools
-                    res = getattr(doc, obj.analysis).addObject(ObjectsFem.makeMeshGmsh(doc, obj.name))[0]
+                    created = getattr(doc, obj.analysis).addObject(ObjectsFem.makeMeshGmsh(doc, obj.name))[0]
                     if "Part" in obj.properties:
                         target_obj = doc.getObject(obj.properties["Part"])
                         if target_obj:
-                            res.Part = target_obj
+                            created.Part = target_obj
                         else:
                             raise ValueError(f"Referenced object '{obj.properties['Part']}' not found.")
                         del obj.properties["Part"]
@@ -296,14 +296,14 @@ class FreeCADRPC:
                         raise ValueError("'Part' property not found in properties.")
 
                     for param, value in obj.properties.items():
-                        if hasattr(res, param):
-                            setattr(res, param, value)
+                        if hasattr(created, param):
+                            setattr(created, param, value)
                     doc.recompute()
 
-                    gmsh_tools = GmshTools(res)
+                    gmsh_tools = GmshTools(created)
                     gmsh_tools.create_mesh()
                     FreeCAD.Console.PrintMessage(
-                        f"FEM Mesh '{res.Name}' generated successfully in '{doc_name}'.\n"
+                        f"FEM Mesh '{created.Name}' generated successfully in '{doc_name}'.\n"
                     )
                 elif obj.type.startswith("Fem::"):
                     fem_make_methods = {
@@ -315,24 +315,26 @@ class FreeCADRPC:
                     make_method = fem_make_methods.get(obj_type_short, getattr(ObjectsFem, method_name, None))
 
                     if callable(make_method):
-                        res = make_method(doc, obj.name)
-                        set_object_property(doc, res, obj.properties)
+                        created = make_method(doc, obj.name)
+                        set_object_property(doc, created, obj.properties)
                         FreeCAD.Console.PrintMessage(
-                            f"FEM object '{res.Name}' created with '{method_name}'.\n"
+                            f"FEM object '{created.Name}' created with '{method_name}'.\n"
                         )
                     else:
                         raise ValueError(f"No creation method '{method_name}' found in ObjectsFem.")
                     if obj.type != "Fem::AnalysisPython" and obj.analysis:
-                        getattr(doc, obj.analysis).addObject(res)
+                        getattr(doc, obj.analysis).addObject(created)
                 else:
-                    res = doc.addObject(obj.type, obj.name)
-                    set_object_property(doc, res, obj.properties)
+                    created = doc.addObject(obj.type, obj.name)
+                    set_object_property(doc, created, obj.properties)
                     FreeCAD.Console.PrintMessage(
-                        f"{res.TypeId} '{res.Name}' added to '{doc_name}' via RPC.\n"
+                        f"{created.TypeId} '{created.Name}' added to '{doc_name}' via RPC.\n"
                     )
- 
+
                 doc.recompute()
-                return True
+                # FreeCAD de-duplicates requested names ('Box' -> 'Box001');
+                # report the actual DocumentObject.Name (upstream #91).
+                return {"ok": True, "object_name": created.Name}
             except Exception as e:
                 return str(e)
         else:
@@ -400,7 +402,7 @@ class FreeCADRPC:
             # Check if the view supports screenshots
             if not hasattr(view, 'saveImage'):
                 return "Current view does not support screenshots"
-                
+
             if view_name == "Isometric":
                 view.viewIsometric()
             elif view_name == "Front":
@@ -432,14 +434,29 @@ def start_rpc_server(host="0.0.0.0", port=9875):
     """Start the XML-RPC server.
 
     Args:
-        host: Bind address. Default "0.0.0.0" allows connections from WSL and network.
-              Use "localhost" to restrict to local connections only.
+        host: Bind address. Default "0.0.0.0" accepts connections from WSL and
+              the network — required when WSL runs in NAT mode (the MCP server
+              connects to the Windows host IP, not loopback). Under WSL
+              mirrored networking, "127.0.0.1" suffices and is the safer bind;
+              pass host="127.0.0.1" or set the FREECAD_MCP_BIND environment
+              variable. Non-loopback binds log a security warning.
         port: Port number (default 9875)
     """
-    global rpc_server_thread, rpc_server_instance
+    global rpc_server_thread, rpc_server_instance, _stop_thread
 
     if rpc_server_instance:
         return "RPC Server already running."
+
+    # A previous stop may still be draining an in-flight request off-thread;
+    # binding before its server_close() would hit the old socket (upstream
+    # #90, d85fd5d).
+    if _stop_thread is not None and _stop_thread.is_alive():
+        _stop_thread.join(timeout=5.0)
+        if _stop_thread.is_alive():
+            return ("RPC Server is still stopping (a request is draining); "
+                    "try again in a few seconds.")
+
+    host = os.environ.get("FREECAD_MCP_BIND", host)
 
     rpc_server_instance = SimpleXMLRPCServer(
         (host, port), allow_none=True, logRequests=False
@@ -448,8 +465,13 @@ def start_rpc_server(host="0.0.0.0", port=9875):
 
     def server_loop():
         FreeCAD.Console.PrintMessage(f"RPC Server started at {host}:{port}\n")
-        if host == "0.0.0.0":
-            FreeCAD.Console.PrintMessage("  Accepting connections from all interfaces (including WSL)\n")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            FreeCAD.Console.PrintWarning(
+                "  RPC server is bound to a non-loopback address and accepts "
+                "unauthenticated connections from the network. Use "
+                "FREECAD_MCP_BIND=127.0.0.1 unless WSL NAT mode requires "
+                "otherwise.\n"
+            )
         rpc_server_instance.serve_forever()
 
     rpc_server_thread = threading.Thread(target=server_loop, daemon=True)
@@ -461,17 +483,39 @@ def start_rpc_server(host="0.0.0.0", port=9875):
 
 
 def stop_rpc_server():
-    global rpc_server_instance, rpc_server_thread
+    global rpc_server_instance, rpc_server_thread, _stop_thread
 
-    if rpc_server_instance:
-        rpc_server_instance.shutdown()
-        rpc_server_thread.join()
-        rpc_server_instance = None
-        rpc_server_thread = None
+    if not rpc_server_instance:
+        return "RPC Server was not running."
+
+    server = rpc_server_instance
+    thread = rpc_server_thread
+    rpc_server_instance = None
+    rpc_server_thread = None
+
+    def _shutdown_and_close():
+        # shutdown() blocks until serve_forever drains the in-flight request,
+        # and that request may itself be waiting on dispatch_to_gui — running
+        # this on the GUI thread (menu command) froze the UI for up to the
+        # dispatch timeout. server_close() must always follow: without it the
+        # listening socket stays bound and Stop -> Start behavior is
+        # undefined (upstream #90, d85fd5d).
+        try:
+            server.shutdown()
+            if thread is not None:
+                thread.join(timeout=10.0)
+                if thread.is_alive():
+                    FreeCAD.Console.PrintWarning(
+                        "MCP RPC: server thread still draining a request; "
+                        "socket closes when it finishes.\n"
+                    )
+        finally:
+            server.server_close()
         FreeCAD.Console.PrintMessage("RPC Server stopped.\n")
-        return "RPC Server stopped."
 
-    return "RPC Server was not running."
+    _stop_thread = threading.Thread(target=_shutdown_and_close, daemon=True)
+    _stop_thread.start()
+    return "RPC Server stopping…"
 
 
 class StartRPCServerCommand:
