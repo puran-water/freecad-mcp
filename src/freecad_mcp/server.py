@@ -629,12 +629,14 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
         A screenshot of the active view.
     """
     freecad = get_freecad_connection()
-    screenshot = freecad.get_active_screenshot(view_name)
-    
-    if screenshot is not None:
-        return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
-    else:
+    try:
+        screenshot = freecad.get_active_screenshot(view_name)
+        if screenshot is not None:
+            return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
         return [TextContent(type="text", text="Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)")]
+    except Exception as e:
+        logger.error("get_view_failed", view_name=view_name, error=str(e))
+        return [TextContent(type="text", text=f"Failed to get view: {str(e)}")]
 
 
 @mcp.tool()
