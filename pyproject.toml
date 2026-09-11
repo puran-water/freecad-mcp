@@ -9,16 +9,27 @@ authors = [
 license = { text = "MIT" }
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=3.0",
-    "mcp>=1.0.0",
+    "fastmcp==3.1.1",
+    "mcp==1.26.0",
     "structlog>=24.0.0",
+    "jsonschema==4.26.0",
+    "engineering-utils",
 ]
+
+[tool.uv.sources]
+engineering-utils = { path = "../../../libs/engineering-utils", editable = true }
 
 [project.scripts]
 freecad-mcp = "freecad_mcp.server:main"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["assets", "results"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../site-fit-mcp/schemas/spatial_contract_v2.json" = "src/freecad_mcp/schemas/spatial_contract_v2.json"
+
+[tool.hatch.build.targets.wheel.force-include]
+"../site-fit-mcp/schemas/spatial_contract_v2.json" = "freecad_mcp/schemas/spatial_contract_v2.json"
 
 [build-system]
 requires = ["hatchling"]

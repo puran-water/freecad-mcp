@@ -22,7 +22,9 @@ All dimensions in the document's model units (mm when following the
 RecycleWorks convention of inches x 25.4 at call sites).
 """
 
-from typing import Any, Callable
+from collections.abc import Sequence
+from typing import Any, Callable, Literal
+import json
 
 import structlog
 from fastmcp import FastMCP, Context
@@ -34,46 +36,52 @@ NEC_DEPTH_BY_CONDITION = {1: 36.0, 2: 42.0, 3: 48.0}  # inches
 EGRESS_MIN_WIDTH_IN = 28.0
 EGRESS_HEIGHT_IN = 78.0
 
+ENVELOPE_KINDS: tuple[str, ...] = ("box", "cylinder", "swing_arc", "nec_110_26", "egress")
 
-def register_clearance_tools(
-    mcp: FastMCP,
-    get_freecad_connection: Callable,
-    add_screenshot_if_available: Callable,
-) -> None:
-    """Register clearance tools with the MCP server."""
+# Single source of truth for envelope parameter contracts. The block library
+# (``engineering_utils.cad.block_model.ENVELOPE_REQUIRED_PARAMS``) mirrors this
+# table and a drift test binds the two — blocks that ship their own service
+# envelopes must produce exactly what this module can build.
+ENVELOPE_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
+    "box": ("x", "y", "z", "dx", "dy", "dz"),
+    "cylinder": ("p1", "axis", "radius", "length"),
+    "swing_arc": ("hinge", "radius", "start_deg", "sweep_deg", "z0", "z1"),
+    "nec_110_26": ("face_x", "face_y", "width", "facing", "condition"),
+    "egress": ("x0", "y0", "length", "axis"),
+}
 
-    @mcp.tool()
-    def clearance_declare(
-        ctx: Context,
-        doc_name: str,
-        name: str,
-        kind: str,
-        params: dict[str, Any],
-        color: list[float] | None = None,
-    ) -> list[TextContent]:
-        """Declare a typed clearance envelope as a ghost solid ``GH_<name>``.
+DEFAULT_ENVELOPE_RGBA = (0.15, 0.45, 0.85)
 
-        Replaces any existing envelope of the same name. See module docstring
-        for kinds and their params. Units follow the document (mm).
-        """
-        kinds = ("box", "cylinder", "swing_arc", "nec_110_26", "egress")
-        if kind not in kinds:
-            return [TextContent(type="text", text=f"Invalid kind '{kind}'. Options: {', '.join(kinds)}")]
-        required = {
-            "box": ("x", "y", "z", "dx", "dy", "dz"),
-            "cylinder": ("p1", "axis", "radius", "length"),
-            "swing_arc": ("hinge", "radius", "start_deg", "sweep_deg", "z0", "z1"),
-            "nec_110_26": ("face_x", "face_y", "width", "facing", "condition"),
-            "egress": ("x0", "y0", "length", "axis"),
-        }[kind]
-        missing = [k for k in required if k not in params]
-        if missing:
-            return [TextContent(type="text", text=f"kind '{kind}' missing params: {missing}")]
-        if kind == "nec_110_26" and params["condition"] not in (1, 2, 3):
-            return [TextContent(type="text", text="nec_110_26 condition must be 1, 2 or 3")]
 
-        rgba = color or [0.15, 0.45, 0.85]
-        code = f'''
+def validate_envelope(kind: str, params: dict[str, Any]) -> str | None:
+    """Return an error message if this envelope is malformed, else ``None``."""
+
+    if kind not in ENVELOPE_KINDS:
+        return f"Invalid kind '{kind}'. Options: {', '.join(ENVELOPE_KINDS)}"
+    missing = [k for k in ENVELOPE_REQUIRED_PARAMS[kind] if k not in params]
+    if missing:
+        return f"kind '{kind}' missing params: {missing}"
+    if kind == "nec_110_26" and params["condition"] not in (1, 2, 3):
+        return "nec_110_26 condition must be 1, 2 or 3"
+    return None
+
+
+def envelope_shape_code(
+    doc_name: str,
+    name: str,
+    kind: str,
+    params: dict[str, Any],
+    rgba: Sequence[float] = DEFAULT_ENVELOPE_RGBA,
+    prefix: str = "GH_",
+) -> str:
+    """Generate the FreeCAD source that builds one ghost envelope solid.
+
+    Extracted so that hand-declared site features (walls, aisles) and
+    block-provided service envelopes emit byte-identical geometry — the gate
+    must not be able to tell where an envelope came from.
+    """
+
+    return f'''
 import FreeCAD, Part, math
 doc = FreeCAD.getDocument("{doc_name}")
 if doc is None:
@@ -82,7 +90,7 @@ V = FreeCAD.Vector
 IN = 25.4
 kind = {kind!r}
 p = {params!r}
-gh_name = "GH_" + {name!r}
+gh_name = {prefix!r} + {name!r}
 old = doc.getObject(gh_name)
 if old:
     doc.removeObject(gh_name)
@@ -128,15 +136,49 @@ doc.recompute()
 bb = o.Shape.BoundBox
 print(f"{{gh_name}} [{kind}]: x {{bb.XMin/IN:.1f}}..{{bb.XMax/IN:.1f}}, y {{bb.YMin/IN:.1f}}..{{bb.YMax/IN:.1f}}, z {{bb.ZMin/IN:.1f}}..{{bb.ZMax/IN:.1f}} in")
 '''
-        freecad = get_freecad_connection()
-        try:
-            res = freecad.execute_code(code)
-            if res.get("success"):
-                return [TextContent(type="text", text=res.get("message", "envelope declared"))]
-            return [TextContent(type="text", text=f"Failed to declare envelope: {res.get('error', 'Unknown error')}")]
-        except Exception as e:
-            logger.error("clearance_declare_failed", name=name, error=str(e))
-            return [TextContent(type="text", text=f"Failed to declare envelope: {e}")]
+
+
+def register_clearance_tools(
+    mcp: FastMCP,
+    _unused_connection: Callable | None,   # was the FreeCAD RPC handle
+    add_screenshot_if_available: Callable,
+) -> None:
+    """Register clearance tools with the MCP server."""
+
+    @mcp.tool()
+    def clearance_declare(
+        ctx: Context,
+        doc_name: str,
+        name: str,
+        kind: str,
+        params: dict[str, Any],
+        color: list[float] | None = None,
+        backend: Literal["build123d"] = "build123d",
+        bundle_path: str | None = None,
+        state_path: str | None = None,
+        basis_note: str | None = None,
+    ) -> list[TextContent]:
+        """Declare a typed clearance envelope as a ghost solid ``GH_<name>``.
+
+        Replaces any existing envelope of the same name. See module docstring
+        for kinds and their params. Units follow the document (mm).
+        """
+        error = validate_envelope(kind, params)
+        if error:
+            return [TextContent(type="text", text=error)]
+
+        if backend=="build123d":
+            if not bundle_path or not state_path or not basis_note:
+                return [TextContent(type="text",text="Headless declaration requires bundle_path, state_path and basis_note.")]
+            if color is not None:
+                return [TextContent(type="text",text="Headless gate declarations carry geometry and basis; GUI ghost colors are unsupported.")]
+            from engineering_utils.cad.block_model import ServiceEnvelope
+            from freecad_mcp.design_tools import _run_cad_module
+            envelope=ServiceEnvelope(name=name,kind=kind,params=params,basis=basis_note)
+            result=_run_cad_module("engineering_utils.cad.clearance",["declare","--state",state_path,
+                "--bundle",bundle_path,"--envelope",envelope.model_dump_json()],backend=backend)
+            return [TextContent(type="text",text=result)]
+
 
     @mcp.tool()
     def clearance_gate(
@@ -146,6 +188,8 @@ print(f"{{gh_name}} [{kind}]: x {{bb.XMin/IN:.1f}}..{{bb.XMax/IN:.1f}}, y {{bb.Y
         allow_pairs: list[list[str]] | None = None,
         min_volume_in3: float = 1.0,
         max_faces: int = 2000,
+        backend: Literal["build123d"] = "build123d",
+        state_path: str | None = None,
     ) -> list[TextContent]:
         """Boolean-check every ``GH_*`` envelope against every real solid.
 
@@ -163,73 +207,13 @@ print(f"{{gh_name}} [{kind}]: x {{bb.XMin/IN:.1f}}..{{bb.XMax/IN:.1f}}, y {{bb.Y
         """
         if not solid_prefixes:
             return [TextContent(type="text", text="solid_prefixes must be non-empty")]
-        code = f'''
-import FreeCAD
-doc = FreeCAD.getDocument("{doc_name}")
-if doc is None:
-    raise ValueError("Document '{doc_name}' not found")
-IN = 25.4
-prefixes = tuple({solid_prefixes!r})
-allow = {allow_pairs or []!r}
-minv = {min_volume_in3} * 16387.064
-
-envs = {{}}
-solids = {{}}
-for o in doc.Objects:
-    if not hasattr(o, "Shape") or o.Shape is None or o.Shape.Volume <= 0:
-        continue
-    if o.Name.startswith("GH_"):
-        envs[o.Name[3:]] = o.Shape
-    elif o.Name.startswith(prefixes):
-        solids[o.Name] = o.Shape
-
-report = []
-fails = 0
-MAX_FACES = {max_faces}
-for ename, esh in sorted(envs.items()):
-    rows_fail = []
-    rows_info = []
-    for sname, ssh in sorted(solids.items()):
-        # bbox prefilter: cheap reject before any boolean (heavy-compound lesson)
-        if not esh.BoundBox.intersected(ssh.BoundBox).isValid():
-            continue
-        # complexity guard: booleans/vertex sweeps on huge vendor compounds
-        # exceed the GUI dispatch budget (observed: 62 MB STEP, >300 s) —
-        # fail closed as UNEVALUATED instead of grinding or skipping
-        if len(ssh.Faces) > MAX_FACES:
-            rows_fail.append(f"    {{sname}}: UNEVALUATED (complexity guard: {{len(ssh.Faces)}} faces > {{MAX_FACES}}; gate a decimated proxy or sub-solids)")
-            continue
-        try:
-            c = esh.common(ssh)
-        except Exception as bex:
-            # fail closed: a boolean failure is not a pass (codex finding 6)
-            rows_fail.append(f"    {{sname}}: UNEVALUATED (boolean failed: {{bex}})")
-            continue
-        if c.Volume < minv:
-            continue
-        bb = c.BoundBox
-        row = f"    {{sname}}: {{c.Volume/16387.064:.0f}} in3 [x {{bb.XMin/IN:.0f}}..{{bb.XMax/IN:.0f}}, y {{bb.YMin/IN:.0f}}..{{bb.YMax/IN:.0f}}, z {{bb.ZMin/IN:.0f}}..{{bb.ZMax/IN:.0f}}]"
-        allowed = any(ename == a[0] and sname.startswith(a[1]) for a in allow)
-        (rows_info if allowed else rows_fail).append(row)
-    status = "FAIL" if rows_fail else "PASS"
-    if rows_fail:
-        fails += 1
-    report.append(f"{{status}}  {{ename}}")
-    report.extend(rows_fail)
-    for r in rows_info:
-        report.append(r.replace("    ", "    [allowed] ", 1))
-print(f"==== CLEARANCE GATE: {{len(envs)}} envelopes vs {{len(solids)}} solids ====")
-print("\\n".join(report))
-print(f"==== VERDICT: {{'PASS' if fails == 0 else f'FAIL ({{fails}} envelope(s))'}} ====")
-'''
-        freecad = get_freecad_connection()
-        try:
-            res = freecad.execute_code(code)
-            if res.get("success"):
-                return [TextContent(type="text", text=res.get("message", ""))]
-            return [TextContent(type="text", text=f"Gate failed to run: {res.get('error', 'Unknown error')}")]
-        except Exception as e:
-            logger.error("clearance_gate_failed", error=str(e))
-            return [TextContent(type="text", text=f"Gate failed to run: {e}")]
-
-    logger.info("clearance_tools_registered")
+        if backend=="build123d":
+            if not state_path:
+                return [TextContent(type="text",text="Headless gate requires state_path from clearance_declare.")]
+            if allow_pairs:
+                return [TextContent(type="text",text="Headless clearance does not permit unbounded prefix allowances; use bounded canonical mating declarations in the shared clash gate.")]
+            from freecad_mcp.design_tools import _run_cad_module
+            arguments=["gate","--state",state_path,"--backend",backend,"--min-volume-mm3",str(min_volume_in3*16387.064),
+                       "--max-faces",str(max_faces)]
+            for prefix in solid_prefixes:arguments.extend(["--prefix",prefix])
+            return [TextContent(type="text",text=_run_cad_module("engineering_utils.cad.clearance",arguments,backend=backend))]
