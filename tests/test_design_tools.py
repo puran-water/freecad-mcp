@@ -40,7 +40,7 @@ def test_no_tool_computes_geometry_itself():
     assert not any(token in SOURCE for token in banned)
 
 
-def test_the_eight_tools_are_registered():
+def test_the_design_tools_are_registered():
     registered = []
 
     class _FakeMCP:
@@ -55,6 +55,9 @@ def test_the_eight_tools_are_registered():
         "cad_basis_validate", "cad_edit_preview", "cad_edit_apply",
         "cad_clash_gate", "cad_publish",
         "cad_asset_inspect", "cad_recipe_export", "cad_review_export",
+        # Reports what this PROCESS serves, which is the one question a stale
+        # host cannot be asked any other way.
+        "cad_capability_fingerprint",
     }
 
 

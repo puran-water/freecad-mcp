@@ -148,8 +148,102 @@ def _run_cad_module(module: str, arguments: list[str], *, backend: str = "build1
     return result.stdout[-8000:].strip()
 
 
+def _served_tool_names():
+    """Names the running server actually exposes, not what the repo defines."""
+    from freecad_mcp import server as _server
+    import asyncio
+    try:
+        tools = asyncio.run(_server.mcp.list_tools())
+    except RuntimeError:                                      # already in a loop
+        return []
+    return [t.name for t in tools]
+
+
+def _worker_identity():
+    """Ask the pinned geometry interpreter what it is. A different process.
+
+    Reported as unavailable rather than guessed when the interpreter is not
+    configured: a fingerprint that invents an answer is worse than one that
+    says it cannot see.
+    """
+    import json
+    import subprocess
+
+    kernel = os.environ.get(BUILD123D_PYTHON_ENV)
+    if not kernel or not Path(kernel).is_file():
+        return {"available": False,
+                "reason": f"{BUILD123D_PYTHON_ENV} is unset or not a file"}
+    script = (
+        "import json\n"
+        "from engineering_utils.cad.build_recipe import build_recipe_hash, runtime_versions\n"
+        "print(json.dumps({'build_recipe_hash': build_recipe_hash(),\n"
+        "                  'runtime_versions': runtime_versions()}))\n"
+    )
+    try:
+        import engineering_utils
+        env = dict(os.environ,
+                   PYTHONPATH=str(Path(engineering_utils.__file__).resolve().parents[1]))
+        done = subprocess.run([kernel, "-c", script], capture_output=True,
+                              text=True, timeout=120, env=env)
+        if done.returncode != 0:
+            return {"available": False, "reason": done.stderr.strip()[-400:]}
+        return {"available": True, **json.loads(done.stdout)}
+    except Exception as exc:                                  # noqa: BLE001
+        return {"available": False, "reason": str(exc)[:300]}
+
+
 def register_design_tools(mcp, _unused_connection: Callable | None, add_screenshot: Callable) -> None:
     """Register the design-system adapter tools."""
+
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False,
+                               idempotentHint=True))
+    def cad_capability_fingerprint(ctx: Context) -> list[TextContent]:
+        """What THIS SERVER PROCESS can do, as opposed to what the repo contains.
+
+        Implemented capability is not activated capability. A host keeps the
+        tool inventory it started with, so a session can be holding an older
+        surface while newer code sits on disk — which has already happened
+        here: a stale host served older layout tools and a catalog missing the
+        thermoplastic request schema, and the mismatch was invisible from
+        inside the session. Read this before any release workflow, and before
+        believing a tool is absent.
+
+        Two identities are reported separately on purpose. The SERVER half is
+        this process: its repo revision and the tools it is actually serving.
+        The WORKER half is the pinned geometry interpreter, which is a
+        different process with a different environment — the server imports no
+        geometry kernel at all, so asking it what build123d version it has
+        would answer about the wrong Python.
+        """
+        import json
+        import subprocess
+        from pathlib import Path as _Path
+
+        import engineering_utils
+
+        repo = _Path(engineering_utils.__file__).resolve().parents[3]
+        def _git(*args):
+            try:
+                return subprocess.run(["git", "-C", str(repo), *args],
+                                      capture_output=True, text=True,
+                                      timeout=10).stdout.strip() or None
+            except Exception:                                 # noqa: BLE001
+                return None
+
+        served = sorted(getattr(t, "name", str(t)) for t in _served_tool_names())
+        report = {
+            "server": {
+                "repo_revision": _git("rev-parse", "HEAD"),
+                "repo_dirty": bool(_git("status", "--porcelain")),
+                "tool_count": len(served),
+                "tools": served,
+                "note": ("this is the inventory THIS PROCESS serves; if it "
+                         "disagrees with the repository, the host has not "
+                         "reconnected since the code changed"),
+            },
+            "worker": _worker_identity(),
+        }
+        return _text(json.dumps(report, indent=2, sort_keys=True))
 
     @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_asset_inspect(ctx: Context, step_path: str, report_path: str,
@@ -243,13 +337,20 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
     @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
     def cad_edit_apply(
         ctx: Context, basis_path: str, blocks_root: str, edits: list[dict[str, Any]],
-        allow_breakage: bool = False,
+        allow_breakage: bool = False, expected_basis_hash: str | None = None,
     ) -> list[TextContent]:
         """Apply edits transactionally and write the basis back.
 
         Refuses when the change introduces a new error unless
         ``allow_breakage`` is set — a designer may legitimately work through an
         intermediate broken state, but it has to be asked for.
+
+        Args:
+            expected_basis_hash: the design hash last read from this basis, as
+                reported by cad_basis_validate or a previous cad_edit_apply.
+                The fleet runs concurrent pe-cad sessions against one file, and
+                without this the second write silently discards the first
+                session's work. Pass it and a stale edit is refused instead.
         """
         from pydantic import TypeAdapter
 
@@ -264,8 +365,11 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
 
         try:
             updated, impact = apply_edits(basis, parsed, interfaces,
-                                          allow_breakage=allow_breakage)
+                                          allow_breakage=allow_breakage,
+                                          expected_basis_hash=expected_basis_hash)
         except EditRejected as exc:
+            return _text(f"NOT APPLIED — nothing was written.\n{exc}")
+        except ValueError as exc:
             return _text(f"NOT APPLIED — nothing was written.\n{exc}")
 
         dump_basis(updated, basis_path)
