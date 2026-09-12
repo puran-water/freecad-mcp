@@ -53,6 +53,24 @@ ENVELOPE_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
 DEFAULT_ENVELOPE_RGBA = (0.15, 0.45, 0.85)
 
 
+try:  # pragma: no cover - depends on the installed mcp
+    from mcp.types import ToolAnnotations
+except ImportError:  # older mcp in the geometry runtime
+    ToolAnnotations = None
+
+
+def _ann(**hints):
+    """Tool annotations, when the installed mcp knows about them.
+
+    The pinned build123d runtime imports this module only to read its envelope
+    contract, never to serve tools, and carries an older mcp without
+    ToolAnnotations. Annotations describe the SERVED surface, so losing them in
+    an import that serves nothing costs nothing — breaking that import costs a
+    cross-runtime contract test.
+    """
+    return ToolAnnotations(**hints) if ToolAnnotations is not None else None
+
+
 def validate_envelope(kind: str, params: dict[str, Any]) -> str | None:
     """Return an error message if this envelope is malformed, else ``None``."""
 
@@ -145,7 +163,7 @@ def register_clearance_tools(
 ) -> None:
     """Register clearance tools with the MCP server."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
     def clearance_declare(
         ctx: Context,
         doc_name: str,
@@ -153,7 +171,6 @@ def register_clearance_tools(
         kind: str,
         params: dict[str, Any],
         color: list[float] | None = None,
-        backend: Literal["build123d"] = "build123d",
         bundle_path: str | None = None,
         state_path: str | None = None,
         basis_note: str | None = None,
@@ -167,7 +184,7 @@ def register_clearance_tools(
         if error:
             return [TextContent(type="text", text=error)]
 
-        if backend=="build123d":
+        if True:
             if not bundle_path or not state_path or not basis_note:
                 return [TextContent(type="text",text="Headless declaration requires bundle_path, state_path and basis_note.")]
             if color is not None:
@@ -176,11 +193,11 @@ def register_clearance_tools(
             from freecad_mcp.design_tools import _run_cad_module
             envelope=ServiceEnvelope(name=name,kind=kind,params=params,basis=basis_note)
             result=_run_cad_module("engineering_utils.cad.clearance",["declare","--state",state_path,
-                "--bundle",bundle_path,"--envelope",envelope.model_dump_json()],backend=backend)
+                "--bundle",bundle_path,"--envelope",envelope.model_dump_json()])
             return [TextContent(type="text",text=result)]
 
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def clearance_gate(
         ctx: Context,
         doc_name: str,
@@ -188,7 +205,6 @@ def register_clearance_tools(
         allow_pairs: list[list[str]] | None = None,
         min_volume_in3: float = 1.0,
         max_faces: int = 2000,
-        backend: Literal["build123d"] = "build123d",
         state_path: str | None = None,
     ) -> list[TextContent]:
         """Boolean-check every ``GH_*`` envelope against every real solid.
@@ -207,13 +223,13 @@ def register_clearance_tools(
         """
         if not solid_prefixes:
             return [TextContent(type="text", text="solid_prefixes must be non-empty")]
-        if backend=="build123d":
+        if True:
             if not state_path:
                 return [TextContent(type="text",text="Headless gate requires state_path from clearance_declare.")]
             if allow_pairs:
                 return [TextContent(type="text",text="Headless clearance does not permit unbounded prefix allowances; use bounded canonical mating declarations in the shared clash gate.")]
             from freecad_mcp.design_tools import _run_cad_module
-            arguments=["gate","--state",state_path,"--backend",backend,"--min-volume-mm3",str(min_volume_in3*16387.064),
+            arguments=["gate","--state",state_path,"--min-volume-mm3",str(min_volume_in3*16387.064),
                        "--max-faces",str(max_faces)]
             for prefix in solid_prefixes:arguments.extend(["--prefix",prefix])
-            return [TextContent(type="text",text=_run_cad_module("engineering_utils.cad.clearance",arguments,backend=backend))]
+            return [TextContent(type="text",text=_run_cad_module("engineering_utils.cad.clearance",arguments))]

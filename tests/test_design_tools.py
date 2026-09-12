@@ -44,7 +44,7 @@ def test_the_eight_tools_are_registered():
     registered = []
 
     class _FakeMCP:
-        def tool(self):
+        def tool(self, **_annotations):
             def decorator(fn):
                 registered.append(fn.__name__)
                 return fn
@@ -62,7 +62,7 @@ def test_every_registered_tool_documents_itself():
     captured = []
 
     class _FakeMCP:
-        def tool(self):
+        def tool(self, **_annotations):
             def decorator(fn):
                 captured.append(fn)
                 return fn
@@ -125,7 +125,7 @@ def test_cad_worker_refuses_arbitrary_modules():
 def test_review_presentation_is_an_argv_value_not_code(monkeypatch):
     registered = {}
     class MCP:
-        def tool(self):
+        def tool(self, **_annotations):
             def capture(fn):
                 registered[fn.__name__] = fn
                 return fn

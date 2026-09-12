@@ -47,6 +47,24 @@ BUILD123D_PYTHON_ENV = "PURANOS_BUILD123D_PYTHON"
 KERNEL_PYTHON_ENV = BUILD123D_PYTHON_ENV
 
 
+try:  # pragma: no cover - depends on the installed mcp
+    from mcp.types import ToolAnnotations
+except ImportError:  # older mcp in the geometry runtime
+    ToolAnnotations = None
+
+
+def _ann(**hints):
+    """Tool annotations, when the installed mcp knows about them.
+
+    The pinned build123d runtime imports this module only to read its envelope
+    contract, never to serve tools, and carries an older mcp without
+    ToolAnnotations. Annotations describe the SERVED surface, so losing them in
+    an import that serves nothing costs nothing — breaking that import costs a
+    cross-runtime contract test.
+    """
+    return ToolAnnotations(**hints) if ToolAnnotations is not None else None
+
+
 def _text(message: str) -> list[TextContent]:
     return [TextContent(type="text", text=message)]
 
@@ -133,20 +151,19 @@ def _run_cad_module(module: str, arguments: list[str], *, backend: str = "build1
 def register_design_tools(mcp, _unused_connection: Callable | None, add_screenshot: Callable) -> None:
     """Register the design-system adapter tools."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_asset_inspect(ctx: Context, step_path: str, report_path: str,
-                          backend: Literal["build123d"] = "build123d") -> list[TextContent]:
+                          ) -> list[TextContent]:
         """Inspect a STEP's physical bodies, hierarchy, bounds and excluded datums.
 
         Uses the shared headless kernel. Writes a new inspection report only;
         does not certify vendor dimensions, nozzle registration or project selection.
         """
         return _text(_run_cad_module("engineering_utils.cad.assets",
-                     ["inspect", "--step", step_path, "--out", report_path,"--backend",backend],backend=backend))
+                     ["inspect", "--step", step_path, "--out", report_path]))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
     def cad_recipe_export(ctx: Context, recipe_path: str, out_dir: str,
-                          backend: Literal["build123d"] = "build123d",
                           recipe_kind: Literal["primitives","equipment_pattern"] = "primitives") -> list[TextContent]:
         """Build neutral STEP and a block interface from a sourced civil/GA recipe.
 
@@ -154,18 +171,16 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         This creates coordination geometry, not approved vendor fabrication detail.
         """
         if recipe_kind=="equipment_pattern":
-            if backend!="build123d":return _text("Equipment patterns require the build123d worker.")
             return _text(_run_cad_module("engineering_utils.cad.pattern_library",
-                ["--pattern",recipe_path,"--out",out_dir],backend=backend))
+                ["--pattern",recipe_path,"--out",out_dir]))
         return _text(_run_cad_module("engineering_utils.cad.recipes",
-                     ["--recipe", recipe_path, "--out", out_dir,"--backend",backend],backend=backend))
+                     ["--recipe", recipe_path, "--out", out_dir]))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
     def cad_review_export(ctx: Context, basis_path: str, blocks_root: str, out_dir: str,
                           drawing_number: str, title: str, revision: str,
                           issue_date: str, pdf: bool = True,
                           presentation_path: str | None = None,
-                          backend: Literal["build123d"] = "build123d",
                           color_mode: Literal["realistic","monochrome"] = "realistic") -> list[TextContent]:
         """Export a non-construction STEP/neutral-loader/views/DXF review bundle.
 
@@ -176,14 +191,14 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         """
         args = ["--basis", basis_path, "--blocks", blocks_root, "--out", out_dir,
                 "--drawing", drawing_number, "--title", title, "--revision", revision,
-                "--issue-date", issue_date,"--backend",backend,"--color-mode",color_mode]
+                "--issue-date", issue_date,"--color-mode",color_mode]
         if not pdf:
             args.append("--no-pdf")
         if presentation_path is not None:
             args.extend(["--presentation", presentation_path])
-        return _text(_run_cad_module("engineering_utils.cad.review", args,backend=backend))
+        return _text(_run_cad_module("engineering_utils.cad.review", args))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_basis_validate(ctx: Context, basis_path: str, blocks_root: str) -> list[TextContent]:
         """Validate a project's ``cad_basis.yaml`` against its block library.
 
@@ -201,7 +216,7 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         findings = validate_basis(basis, interfaces)
         return _text(f"{basis_report(findings)}\n\ndesign hash: {basis_hash(basis)}")
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_edit_preview(
         ctx: Context, basis_path: str, blocks_root: str, edits: list[dict[str, Any]]
     ) -> list[TextContent]:
@@ -225,7 +240,7 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         _, impact = preview_edits(basis, parsed, interfaces)
         return _text(impact.summary())
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
     def cad_edit_apply(
         ctx: Context, basis_path: str, blocks_root: str, edits: list[dict[str, Any]],
         allow_breakage: bool = False,
@@ -257,17 +272,16 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         return _text(f"{impact.summary()}\n\nwrote {basis_path} "
                      f"(design hash {basis_hash(updated)})")
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_clash_gate(ctx: Context, basis_path: str, blocks_root: str,
-                       backend: Literal["build123d"] = "build123d") -> list[TextContent]:
+                       ) -> list[TextContent]:
         """Run the solid-vs-solid interference gate on a basis.
 
         Compiles the basis to solids and intersects them with real booleans.
         Needs a geometry kernel; reports UNAVAILABLE rather than passing when
         there is none.
         """
-        if backend=="build123d":
-            return _text(_clash_via_kernel(basis_path,blocks_root,backend=backend))
+        return _text(_clash_via_kernel(basis_path, blocks_root))
         try:
             from engineering_utils.cad.basis import basis_hash, load_basis, load_interfaces
             from engineering_utils.cad.geometry import interference_from_basis
@@ -286,25 +300,44 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         except Exception as exc:
             return _text(f"CLASH GATE FAILED: {exc}. This is NOT a pass.")
 
-    @mcp.tool()
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
     def cad_publish(
         ctx: Context, basis_path: str, blocks_root: str, out_dir: str,
         drawing_number: str, title: str, revision: str, issue_date: str,
         plane: str = "xy", units: str = "in", pdf: bool = True,
+        hazard_path: str | None = None,
     ) -> list[TextContent]:
         """Compose and issue a GA sheet from the basis.
 
         Validates the basis and the sheet first and writes nothing if either
         fails — a DXF on disk gets emailed; a validation message does not.
+
+        Args:
+            hazard_path: hazard_basis/v1 JSON carrying the APPROVED
+                hazardous-area inputs. Without it the compliance lens is
+                vacuous and CODE-NO-AREA-CLASSIFICATION blocks the issue, so
+                an issue is not reachable without one. CAD verifies geometry
+                against a classification somebody competent approved; it does
+                not originate one, which is why this is a separate document
+                rather than a field on the basis.
+
+        Issuing is NOT idempotent: a second call at the same drawing number and
+        revision is refused because the first issue is immutable.
         """
         from engineering_utils.cad.basis import basis_report
         from engineering_utils.cad.publish import publish_project
 
         try:
+            hazard = None
+            if hazard_path:
+                from engineering_utils.cad.hazardous_area import HazardBasis
+                hazard = HazardBasis.model_validate_json(
+                    Path(hazard_path).read_text())
             basis, _ = _load(basis_path, blocks_root)
             findings, manifest = publish_project(
                 basis, blocks_root, out_dir, drawing_number=drawing_number, title=title,
-                revision=revision, issue_date=issue_date, plane=plane, units=units, pdf=pdf)
+                revision=revision, issue_date=issue_date, plane=plane, units=units,
+                pdf=pdf, hazard=hazard)
         except Exception as exc:
             return _text(f"Publish failed: {exc}")
 
