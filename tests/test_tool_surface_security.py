@@ -29,6 +29,9 @@ def test_deployed_surface_matches_adr_c4_allowlist():
     names = {tool.name for tool in asyncio.run(mcp.list_tools())}
     assert names == {
         "cad_capability_fingerprint",
+        "cad_corridor_probe",
+        "cad_route_reconcile",
+        "cad_route_author",
         "clearance_declare",
         "clearance_gate",
         "cad_basis_validate",
@@ -71,5 +74,5 @@ def test_startup_connects_to_nothing_and_still_serves_every_tool():
 
     async def scenario():
         async with server.server_lifespan(server.mcp):
-            assert len(await server.mcp.list_tools()) == 21
+            assert len(await server.mcp.list_tools()) == 24
     asyncio.run(scenario())

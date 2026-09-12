@@ -311,6 +311,134 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         return _text(f"{basis_report(findings)}\n\ndesign hash: {basis_hash(basis)}")
 
     @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+    def cad_corridor_probe(
+        ctx: Context, basis_path: str, blocks_root: str,
+        legs: list[dict[str, Any]], pad_mm: float = 60.0,
+        exclude: list[str] | None = None,
+    ) -> list[TextContent]:
+        """Which placed equipment lies in the way of candidate route legs.
+
+        Ask this BEFORE drawing a run across a plant. Each leg is a straight
+        segment ``{"name": ..., "start_mm": [x,y,z], "end_mm": [x,y,z]}`` and
+        the answer names the blocks whose envelopes it passes through.
+
+        ``pad_mm`` is the half-width of the slot swept along the leg — give it
+        the pipe's outside radius plus its installation and insulation
+        allowance, because a corridor that fits the centreline and not the pipe
+        is not a corridor. ``exclude`` drops the run's own terminal equipment,
+        which otherwise reports as blocking the run that connects to it.
+
+        Coarse and fast on purpose: it chooses a corridor, it does not replace
+        cad_clash_gate, which intersects real solids and is the only thing that
+        returns a verdict.
+        """
+        from engineering_utils.cad.revision_tools import corridor_clearance
+
+        try:
+            basis, interfaces = _load(basis_path, blocks_root)
+            results = corridor_clearance(basis, interfaces, legs,
+                                         pad_mm=pad_mm, exclude=exclude or [])
+        except Exception as exc:
+            return _text(f"Rejected: {exc}")
+
+        lines = []
+        for result in results:
+            if result.clear:
+                lines.append(f"CLEAR    {result.name}")
+            else:
+                lines.append(f"BLOCKED  {result.name}: {', '.join(result.blocked_by)}")
+        clear = sum(1 for r in results if r.clear)
+        return _text(f"{clear}/{len(results)} legs clear at pad {pad_mm:g} mm\n"
+                     + "\n".join(lines))
+
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+    def cad_route_reconcile(
+        ctx: Context, basis_path: str, blocks_root: str, tolerance_mm: float = 1.0,
+    ) -> list[TextContent]:
+        """Route endpoints that no longer meet the port they claim to.
+
+        Run this after ANY revision that resized or moved equipment. A route
+        endpoint is a statement about where pipe meets a machine; swap a 2.5in
+        valve for a 3in one and its ports move 29.3 mm, and the endpoint left
+        behind lands the far end of the line metres from its target — reported
+        as one open joint at the opposite end of the line from the cause.
+
+        Reports only. Apply the corrections through cad_edit_apply so they are
+        recorded in the change ledger.
+        """
+        from engineering_utils.cad.revision_tools import reconcile_endpoints
+
+        try:
+            basis, interfaces = _load(basis_path, blocks_root)
+            report = reconcile_endpoints(basis, interfaces, tolerance_mm=tolerance_mm)
+        except Exception as exc:
+            return _text(f"Rejected: {exc}")
+
+        lines = [f"{report.routes_checked} routes checked, "
+                 f"{len(report.drifted)} endpoint(s) adrift beyond {tolerance_mm:g} mm"]
+        for drift in report.drifted:
+            lines.append(
+                f"  {drift.route_id} [{drift.which}] {drift.port_ref}: "
+                f"{drift.drift_mm:.1f} mm adrift; "
+                f"{[round(v, 1) for v in drift.was_mm]} -> "
+                f"{[round(v, 1) for v in drift.should_be_mm]}")
+        if report.unresolved:
+            lines.append(f"  {len(report.unresolved)} endpoint(s) name nothing this "
+                         "basis can resolve to a port: " + ", ".join(report.unresolved[:8]))
+        return _text("\n".join(lines))
+
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+    def cad_route_author(
+        ctx: Context, basis_path: str, blocks_root: str, run: dict[str, Any],
+    ) -> list[TextContent]:
+        """Author one thermoplastic socket run as a declared line, route and blocks.
+
+        Hand this a ``SocketRun`` — line_id, spec_id, nominal_size, from_ref,
+        to_ref, waypoints_mm, source — and it returns the line, route and
+        fitting interfaces ready to hand to cad_edit_apply as a PipingUpsert.
+
+        USE THIS RATHER THAN WRITING THE COMPONENT GRAPH BY HAND. It refuses,
+        up front and by name, the mistakes that otherwise surface as one open
+        joint far from their cause: a first leg that does not leave along the
+        port's own outward axis, a non-orthogonal or zero-length leg, a size
+        transition with no physical reducer, a terminal preparation the socket
+        family does not support, and an exposed spool below the minimum without
+        a source-linked note.
+
+        Reports only — nothing is written.
+        """
+        from engineering_utils.cad.piping_network import author_run
+        from engineering_utils.cad.routing import world_ports
+
+        try:
+            basis, interfaces = _load(basis_path, blocks_root)
+            spec = next((s for s in basis.plant.specs
+                         if s.spec_id == run.get("spec_id")), None)
+            if spec is None:
+                return _text(f"Rejected: no piping spec {run.get('spec_id')!r} in this basis")
+            ports = {}
+            for ref in (run.get("from_ref"), run.get("to_ref")):
+                tag, _, name = str(ref).partition(".")
+                block = basis.block(tag)
+                if block is None or block.slug not in interfaces:
+                    return _text(f"Rejected: {ref} does not name a placed block with an interface")
+                found = next((w for w in world_ports(tag, interfaces[block.slug],
+                                                     block.placement) if w.name == name), None)
+                if found is None:
+                    return _text(f"Rejected: {ref} names no port on {block.slug}")
+                ports[ref] = found
+            line, route, catalog = author_run(
+                run, spec, ports[run["from_ref"]], ports[run["to_ref"]])
+        except Exception as exc:
+            return _text(f"Rejected: {exc}")
+
+        return _text(
+            f"{line.line_id}: {len(line.components)} components, {len(line.joints)} joints, "
+            f"{len(route.waypoints_mm)} waypoints, bend radius {route.bend_radius_mm:.2f} mm\n"
+            f"blocks required: {', '.join(sorted(catalog))}\n"
+            "Apply with cad_edit_apply as a piping_upsert carrying this line and route.")
+
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_edit_preview(
         ctx: Context, basis_path: str, blocks_root: str, edits: list[dict[str, Any]]
     ) -> list[TextContent]:

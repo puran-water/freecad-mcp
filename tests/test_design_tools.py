@@ -58,6 +58,10 @@ def test_the_design_tools_are_registered():
         # Reports what this PROCESS serves, which is the one question a stale
         # host cannot be asked any other way.
         "cad_capability_fingerprint",
+        # Choose a corridor before drawing a run; find the endpoints a resize
+        # left behind; author a socket run through the helper that refuses the
+        # mistakes which otherwise surface as one open joint far from the cause.
+        "cad_corridor_probe", "cad_route_reconcile", "cad_route_author",
     }
 
 
