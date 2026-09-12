@@ -354,25 +354,32 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         """
         from pydantic import TypeAdapter
 
-        from engineering_utils.cad.basis import basis_hash, dump_basis
+        from engineering_utils.cad.basis import (
+            basis_hash, basis_write_lock, dump_basis)
         from engineering_utils.cad.edits import Edit, EditRejected, apply_edits
 
-        try:
-            basis, interfaces = _load(basis_path, blocks_root)
-            parsed = [TypeAdapter(Edit).validate_python(e) for e in edits]
-        except Exception as exc:
-            return _text(f"Rejected: {exc}")
+        # Load, apply and write under one lock. expected_basis_hash alone
+        # compares against the copy this process already read, so two editors
+        # who both passed the correct original hash both wrote and the first
+        # edit vanished. The fleet runs concurrent pe-cad sessions.
+        with basis_write_lock(basis_path):
+            try:
+                basis, interfaces = _load(basis_path, blocks_root)
+                parsed = [TypeAdapter(Edit).validate_python(e) for e in edits]
+            except Exception as exc:
+                return _text(f"Rejected: {exc}")
 
-        try:
-            updated, impact = apply_edits(basis, parsed, interfaces,
-                                          allow_breakage=allow_breakage,
-                                          expected_basis_hash=expected_basis_hash)
-        except EditRejected as exc:
-            return _text(f"NOT APPLIED — nothing was written.\n{exc}")
-        except ValueError as exc:
-            return _text(f"NOT APPLIED — nothing was written.\n{exc}")
+            try:
+                updated, impact = apply_edits(basis, parsed, interfaces,
+                                              allow_breakage=allow_breakage,
+                                              expected_basis_hash=expected_basis_hash)
+            except EditRejected as exc:
+                return _text(f"NOT APPLIED — nothing was written.\n{exc}")
+            except ValueError as exc:
+                return _text(f"NOT APPLIED — nothing was written.\n{exc}")
 
-        dump_basis(updated, basis_path)
+            dump_basis(updated, basis_path,
+                       expected_disk_hash=basis_hash(basis))
         return _text(f"{impact.summary()}\n\nwrote {basis_path} "
                      f"(design hash {basis_hash(updated)})")
 
