@@ -1,14 +1,8 @@
-"""Tier-2 tests for the extracted envelope codegen.
-
-Two jobs:
-1. The refactor is behaviour-neutral — generated source still compiles and
-   still contains the geometry calls each kind depends on.
-2. Contract drift between this module and the block library is caught
-   mechanically, so a block can never ship an envelope the gate cannot build.
-"""
+"""Typed clearance validation and delegation to the shared headless worker."""
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -19,10 +13,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from freecad_mcp.clearance_tools import (  # noqa: E402
-    DEFAULT_ENVELOPE_RGBA,
     ENVELOPE_KINDS,
     ENVELOPE_REQUIRED_PARAMS,
-    envelope_shape_code,
+    register_clearance_tools,
     validate_envelope,
 )
 
@@ -36,44 +29,71 @@ VALID_PARAMS: dict[str, dict] = {
 }
 
 
-@pytest.mark.parametrize("kind", ENVELOPE_KINDS)
-def test_generated_source_compiles(kind):
-    code = envelope_shape_code("DOC", "TEST", kind, VALID_PARAMS[kind])
-    compile(code, f"<{kind}>", "exec")
+@pytest.fixture
+def delegated_tools(monkeypatch):
+    from freecad_mcp import design_tools
+
+    registered, calls = {}, []
+
+    class MCP:
+        def tool(self, **_annotations):
+            def capture(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return capture
+
+    def worker(module, arguments):
+        calls.append((module, arguments))
+        return "worker result"
+
+    monkeypatch.setattr(design_tools, "_run_cad_module", worker)
+    register_clearance_tools(MCP(), None, lambda *args: None)
+    assert set(registered) == {"clearance_declare", "clearance_gate"}
+    return registered, calls
 
 
 @pytest.mark.parametrize("kind", ENVELOPE_KINDS)
-def test_generated_source_names_the_ghost(kind):
-    code = envelope_shape_code("DOC", "MyEnv", kind, VALID_PARAMS[kind])
-    assert "'GH_' + 'MyEnv'" in code or '"GH_" + \'MyEnv\'' in code or "GH_" in code
-    assert 'FreeCAD.getDocument("DOC")' in code
+def test_declaration_passes_a_typed_envelope_to_the_shared_worker(delegated_tools, kind):
+    registered, calls = delegated_tools
+    response = registered["clearance_declare"](
+        None, "compatibility label", "service", kind, VALID_PARAMS[kind],
+        bundle_path="review.bundle.json", state_path="clearance.json", basis_note="fixture travel",
+    )
+    assert response[0].text == "worker result"
+    assert len(calls) == 1
+    module, args = calls[0]
+    assert module == "engineering_utils.cad.clearance"
+    assert args[:-1] == [
+        "declare", "--state", "clearance.json", "--bundle", "review.bundle.json", "--envelope",
+    ]
+    envelope = json.loads(args[-1])
+    assert envelope["kind"] == kind and envelope["name"] == "service"
+    assert envelope["params"] == VALID_PARAMS[kind]
+    assert envelope["basis"] == "fixture travel"
 
 
-def test_prefix_is_overridable_for_block_proxies():
-    code = envelope_shape_code("DOC", "P1_body", "box", VALID_PARAMS["box"], prefix="PX_")
-    assert "'PX_'" in code
+def test_gate_preserves_prefixes_and_converts_the_volume_unit(delegated_tools):
+    registered, calls = delegated_tools
+    response = registered["clearance_gate"](
+        None, "compatibility label", ["PUMP", "PANEL"], min_volume_in3=2,
+        max_faces=150, state_path="clearance.json",
+    )
+    assert response[0].text == "worker result"
+    assert calls == [("engineering_utils.cad.clearance", [
+        "gate", "--state", "clearance.json", "--min-volume-mm3", "32774.128",
+        "--max-faces", "150", "--prefix", "PUMP", "--prefix", "PANEL",
+    ])]
 
 
-@pytest.mark.parametrize("kind,marker", [
-    ("box", "Part.makeBox"),
-    ("cylinder", "Part.makeCylinder"),
-    ("swing_arc", "shape.rotate"),
-    ("nec_110_26", "36.0"),
-    ("egress", "28.0"),
+@pytest.mark.parametrize("kwargs,message", [
+    ({}, "requires state_path"),
+    ({"state_path": "clearance.json", "allow_pairs": [["door", "PUMP"]]}, "does not permit"),
 ])
-def test_geometry_call_preserved_per_kind(kind, marker):
-    code = envelope_shape_code("DOC", "T", kind, VALID_PARAMS[kind])
-    assert marker in code
-
-
-def test_colour_is_applied():
-    code = envelope_shape_code("DOC", "T", "box", VALID_PARAMS["box"], rgba=(0.9, 0.1, 0.2))
-    assert "(0.9, 0.1, 0.2)" in code
-
-
-def test_default_colour_used_when_unspecified():
-    code = envelope_shape_code("DOC", "T", "box", VALID_PARAMS["box"])
-    assert str(DEFAULT_ENVELOPE_RGBA[0]) in code
+def test_unbounded_or_unbound_gate_requests_never_reach_the_worker(delegated_tools, kwargs, message):
+    registered, calls = delegated_tools
+    response = registered["clearance_gate"](None, "compatibility label", ["PUMP"], **kwargs)
+    assert message in response[0].text
+    assert calls == []
 
 
 # --- validation ---------------------------------------------------------

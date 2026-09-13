@@ -16,11 +16,8 @@ The original five design tools are joined by three bounded asset/review adapters
 * ``cad_recipe_export``  — sourced civil/GA recipe to neutral STEP
 * ``cad_review_export``  — explicitly non-issuable model/drawing package
 
-The clash gate needs a geometry kernel. This server's environment usually has
-none (it drives a Windows GUI over XML-RPC), so the tool **delegates to a
-headless FreeCAD interpreter** when one is configured and says plainly when it
-cannot run — a clash check that silently does not happen is worse than one that
-refuses.
+The server delegates geometry work to the isolated build123d interpreter and
+reports when it cannot run. A missing clash check must never look like a pass.
 """
 
 from __future__ import annotations
@@ -38,11 +35,8 @@ from mcp.types import TextContent
 
 logger = structlog.get_logger("FreeCADMCPserver.design")
 
-#: Interpreter with FreeCAD importable, for the clash gate. Set to the conda
-#: env used for headless work; unset means the gate reports UNAVAILABLE.
-#: The one geometry interpreter. ``KERNEL_PYTHON_ENV`` is kept as the name the
-#: rest of this module uses so a second backend, if one is ever qualified, has
-#: an obvious place to be named -- it is no longer a choice between two.
+#: The isolated geometry interpreter; unset means the gate reports UNAVAILABLE.
+#: Keep the existing alias for callers that configure the worker by this name.
 BUILD123D_PYTHON_ENV = "PURANOS_BUILD123D_PYTHON"
 KERNEL_PYTHON_ENV = BUILD123D_PYTHON_ENV
 
@@ -89,9 +83,6 @@ def _clash_via_kernel(basis_path: str, blocks_root: str, *, backend: str = "buil
         )
 
     script = (
-        "import sys, os\n"
-        "lib = None  # one kernel; nothing to put on the path beside it\n"
-        "if lib: sys.path.insert(0, lib)\n"
         "from engineering_utils.cad.basis import load_basis, load_interfaces, basis_hash\n"
         "from engineering_utils.cad.geometry import interference_from_basis\n"
         "from engineering_utils.cad.publish import _compiled_lines\n"
@@ -521,23 +512,6 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
         there is none.
         """
         return _text(_clash_via_kernel(basis_path, blocks_root))
-        try:
-            from engineering_utils.cad.basis import basis_hash, load_basis, load_interfaces
-            from engineering_utils.cad.geometry import interference_from_basis
-            from engineering_utils.cad.publish import _compiled_lines
-            from engineering_utils.cad.interference import format_report
-
-            import FreeCAD  # noqa: F401,PLC0415 - probing for a local kernel
-
-            basis = load_basis(basis_path)
-            interfaces = load_interfaces(blocks_root)
-            run = interference_from_basis(basis, interfaces, model_hash=basis_hash(basis),
-                                          compiled_lines=_compiled_lines(basis, interfaces))
-            return _text(format_report(run))
-        except ImportError:
-            return _text(_clash_via_kernel(basis_path, blocks_root))
-        except Exception as exc:
-            return _text(f"CLASH GATE FAILED: {exc}. This is NOT a pass.")
 
     @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
     def cad_publish(
