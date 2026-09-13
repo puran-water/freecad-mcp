@@ -164,3 +164,41 @@ def test_cad_worker_passes_paths_as_argv_not_shell(monkeypatch, tmp_path):
     assert design_tools._run_cad_module("engineering_utils.cad.assets", ["inspect", "--step", hostile]) == "ok"
     assert captured["argv"][-1] == hostile
     assert not captured["kwargs"].get("shell")
+
+
+# --- the edit payload the adapter parses carries envelope suppression -----
+
+
+_PUMP_SKID = (Path(__file__).resolve().parents[4]
+              / "libs" / "engineering-utils" / "tests" / "cad" / "fixtures" / "pump-skid")
+
+
+def test_edit_preview_accepts_a_suppressed_envelope_dict_payload():
+    """A block_upsert dict with envelopes_off + suppression_reason is a valid edit.
+
+    The adapter parses edits through the shared ``Edit`` union; if the union's
+    BlockUpsert cannot carry the suppression fields the tool answers
+    ``Rejected`` and a deliberate suppression cannot be preserved from a host.
+    """
+    registered = {}
+
+    class MCP:
+        def tool(self, **_annotations):
+            def capture(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return capture
+
+    design_tools.register_design_tools(MCP(), lambda: None, lambda *a: None)
+    payload = {
+        "op": "block_upsert", "tag": "P-01", "slug": "pump.transfer",
+        "reason": "carry the agreed aisle-sharing suppression through re-issue",
+        "placement": {"position_mm": [4500.0, -900.0, 210.0]},
+        "envelopes_off": ["withdrawal"],
+        "suppression_reason": "shared aisle with P-02, agreed with vendor 2026-08-14",
+    }
+    out = registered["cad_edit_preview"](
+        None, str(_PUMP_SKID / "cad_basis.yaml"), str(_PUMP_SKID / "blocks"), [payload])
+    text = "".join(getattr(item, "text", str(item)) for item in out)
+    assert not text.startswith("Rejected"), text
+    assert "upsert block P-01" in text
