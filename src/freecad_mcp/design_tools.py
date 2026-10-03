@@ -266,7 +266,9 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
                           drawing_number: str, title: str, revision: str,
                           issue_date: str, pdf: bool = True,
                           presentation_path: str | None = None,
-                          color_mode: Literal["realistic","monochrome"] = "realistic") -> list[TextContent]:
+                          color_mode: Literal["realistic","monochrome"] = "realistic",
+                          geometry_cache: str | None = None, projection_cache: str | None = None,
+                          geometry_only: bool = False) -> list[TextContent]:
         """Export a non-construction STEP/neutral-loader/views/DXF review bundle.
 
         Preserves all holds and failed checks. Every bundle is immutable and
@@ -281,7 +283,34 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
             args.append("--no-pdf")
         if presentation_path is not None:
             args.extend(["--presentation", presentation_path])
+        if geometry_cache: args.extend(["--geometry-cache",geometry_cache])
+        if projection_cache: args.extend(["--projection-cache",projection_cache])
+        if geometry_only: args.append("--geometry-only")
         return _text(_run_cad_module("engineering_utils.cad.review", args))
+
+    @mcp.tool()
+    def cad_workflow_preflight(basis_path:str,blocks_root:str,component_policy:str="complete_only")->dict:
+        """Aggregate basis, realization and route failures before starting the CAD kernel."""
+        from engineering_utils.cad.workflow import preflight
+        return preflight(basis_path,blocks_root,component_policy=component_policy)
+
+    @mcp.tool()
+    def cad_workflow_submit(request:dict[str,Any])->dict:
+        """Submit a typed held CAD review to a durable subprocess; return job ID."""
+        from engineering_utils.cad.workflow import CadReviewJob, submit
+        return submit(CadReviewJob.model_validate(request))
+
+    @mcp.tool()
+    def cad_workflow_status(job_id:str)->dict:
+        """Read verified progress/artifact references without geometry arrays."""
+        from engineering_utils.cad.workflow import job_store
+        return job_store().status(job_id)
+
+    @mcp.tool()
+    def cad_workflow_cancel(job_id:str)->dict:
+        """Cancel the owned CAD job process group."""
+        from engineering_utils.cad.workflow import job_store
+        return job_store().cancel(job_id)
 
     @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_basis_validate(ctx: Context, basis_path: str, blocks_root: str) -> list[TextContent]:

@@ -138,7 +138,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 mcp = FastMCP(
     "plant-cad-mcp",
     instructions=("Process plant CAD through shared canonical contracts and headless build123d tooling; "
-                  "FreeCAD is an optional authenticated verification adapter. "
+                  "build123d is the sole geometry kernel. "
                   "The browser review viewer is separate from the modeling and verification tools."),
     lifespan=server_lifespan,
 )
