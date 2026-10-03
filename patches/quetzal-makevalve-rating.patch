@@ -1,0 +1,28 @@
+Subject: [PATCH] fix(valve): bind `rating` before use in _execute_legacy
+
+`Valve._execute_legacy` reads a bare `rating` that is never bound in the
+function, so every legacy-CSV valve that is neither knife nor pinch raises
+`NameError: name 'rating' is not defined` instead of building.
+
+The two branches immediately above it already do the right thing with
+`fp.PRating.lower()`; this binds that once and uses it consistently.
+
+Reproduced with Quetzal 1.8.9 (76cc1a62788898e732b908465fe42d7e9f220d5d) —
+`pCmd.makeValve(...)` on any ball/globe/generic rating.
+
+Upstream: https://github.com/sargo-devel/Quetzal   (not yet submitted)
+
+--- a/pFeatures.py
++++ b/pFeatures.py
+@@ -2523,10 +2523,11 @@
+     def _execute_legacy(self, fp, H):
+-        if fp.PRating.lower().find("knife") + 1:
++        rating = fp.PRating.lower()
++        if rating.find("knife") + 1:
+             self._execute_knife_gate(fp, H)
+             return
+-        if fp.PRating.lower().find("pinch") + 1:
++        if rating.find("pinch") + 1:
+             self._execute_pinch(fp, H)
+             return
+ 

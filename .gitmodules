@@ -1,0 +1,4 @@
+[submodule "vendor/quetzal"]
+	path = vendor/quetzal
+	url = https://github.com/puran-water/quetzal.git
+	branch = headless-fixes

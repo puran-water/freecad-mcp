@@ -37,11 +37,13 @@ def wsl_to_windows_path(wsl_path: str, use_forward_slashes: bool = True) -> str:
     if not wsl_path:
         return wsl_path
 
-    # Already a Windows path? Return as-is
-    # Check for drive letter patterns: C:\, C:/, or UNC paths \\server\
+    # Already a Windows path? Normalize separators before returning: these
+    # paths get embedded into generated FreeCAD code as string literals, and a
+    # backslash before 'U' (C:\\Users\\...) is a truncated \\UXXXXXXXX unicode
+    # escape -> SyntaxError. Windows accepts forward slashes everywhere.
     if len(wsl_path) >= 3:
         if wsl_path[1:3] == ':\\' or wsl_path[1:3] == ':/':
-            return wsl_path
+            return wsl_path.replace('\\', '/') if use_forward_slashes else wsl_path
     if wsl_path.startswith('\\\\'):
         return wsl_path
 
