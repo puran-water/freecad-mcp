@@ -62,6 +62,8 @@ def test_the_design_tools_are_registered():
         # left behind; author a socket run through the helper that refuses the
         # mistakes which otherwise surface as one open joint far from the cause.
         "cad_corridor_probe", "cad_route_reconcile", "cad_route_author",
+        "cad_workflow_preflight", "cad_workflow_submit", "cad_workflow_status", "cad_workflow_cancel",
+        "cad_concept_preview", "cad_concept_export",
     }
 
 
@@ -78,6 +80,31 @@ def test_every_registered_tool_documents_itself():
     design_tools.register_design_tools(_FakeMCP(), lambda: None, lambda *a, **k: None)
     for fn in captured:
         assert fn.__doc__ and len(fn.__doc__.strip()) > 40, fn.__name__
+
+
+def test_concept_adapter_returns_a_compact_shared_summary():
+    import json
+    from engineering_utils.cad.basis import load_basis, basis_hash
+    captured = {}
+
+    class Capture:
+        def tool(self, **annotations):
+            def decorate(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return decorate
+
+    design_tools.register_design_tools(Capture(), lambda: None, lambda *a, **k: None)
+    root = Path(os.environ.get("PURANOS_TEST_REPO", "/home/hvksh/professional"))
+    fixture = root / "libs/engineering-utils/tests/cad/fixtures/pump-skid"
+    basis = fixture / "cad_basis.yaml"
+    result = captured["cad_concept_preview"](str(basis), str(fixture / "blocks"), {
+        "expected_basis_hash": basis_hash(load_basis(basis)),
+        "reason": "Synthetic compact tool response verification",
+    })
+    assert result["schema_version"] == "cad_concept_summary/v1"
+    assert result["occurrences"] > 50 and result["issuable"] is False
+    assert isinstance(result["prototypes"], int) and len(json.dumps(result)) < 8000
 
 
 # --- a gate that cannot run must not look like a pass --------------------
@@ -169,8 +196,7 @@ def test_cad_worker_passes_paths_as_argv_not_shell(monkeypatch, tmp_path):
 # --- the edit payload the adapter parses carries envelope suppression -----
 
 
-_PUMP_SKID = (Path(__file__).resolve().parents[4]
-              / "libs" / "engineering-utils" / "tests" / "cad" / "fixtures" / "pump-skid")
+_PUMP_SKID = Path(os.environ.get("PURANOS_TEST_REPO", str(Path(__file__).resolve().parents[4]))) / "libs/engineering-utils/tests/cad/fixtures/pump-skid"
 
 
 def test_edit_preview_accepts_a_suppressed_envelope_dict_payload():

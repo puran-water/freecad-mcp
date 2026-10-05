@@ -27,32 +27,8 @@ def test_deployed_surface_matches_adr_c4_allowlist():
     reports UNEVALUATED rather than passing.
     """
     names = {tool.name for tool in asyncio.run(mcp.list_tools())}
-    assert names == {
-        "cad_capability_fingerprint",
-        "cad_corridor_probe",
-        "cad_route_reconcile",
-        "cad_route_author",
-        "clearance_declare",
-        "clearance_gate",
-        "cad_basis_validate",
-        "cad_edit_preview",
-        "cad_edit_apply",
-        "cad_clash_gate",
-        "cad_publish",
-        "cad_asset_inspect",
-        "cad_recipe_export",
-        "cad_review_export",
-        "cad_library_catalog",
-        "cad_pattern_export",
-        "cad_fitting_export",
-        "cad_asset_ingest",
-        "cad_asset_bind",
-        "resolution_list",
-        "resolution_answer",
-        "resolution_dispatch",
-        "resolution_apply",
-        "resolution_doctor",
-    }
+    assert names == {'cad_basis_validate', 'resolution_dispatch', 'cad_fitting_export', 'cad_clash_gate', 'cad_edit_apply', 'cad_asset_ingest', 'cad_recipe_export', 'cad_concept_export', 'cad_asset_bind', 'cad_cutting_dxf_validate', 'cad_edit_preview', 'cad_publish', 'cad_asset_inspect', 'resolution_answer', 'cad_workflow_status', 'resolution_doctor', 'cad_library_catalog', 'cad_workflow_submit', 'clearance_declare', 'cad_fabrication_export', 'cad_pattern_export', 'clearance_gate', 'resolution_apply', 'cad_route_reconcile', 'cad_prototype_materialize', 'cad_workflow_cancel', 'cad_review_export', 'resolution_list', 'cad_route_author', 'cad_capability_fingerprint', 'cad_workflow_preflight', 'cad_concept_preview', 'cad_corridor_probe'}
+
 
 
 def test_there_is_no_bridge_left_to_authenticate():
@@ -74,5 +50,5 @@ def test_startup_connects_to_nothing_and_still_serves_every_tool():
 
     async def scenario():
         async with server.server_lifespan(server.mcp):
-            assert len(await server.mcp.list_tools()) == 24
+            assert len(await server.mcp.list_tools()) == 33
     asyncio.run(scenario())

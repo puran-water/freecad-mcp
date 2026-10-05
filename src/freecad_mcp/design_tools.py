@@ -308,9 +308,33 @@ def register_design_tools(mcp, _unused_connection: Callable | None, add_screensh
 
     @mcp.tool()
     def cad_workflow_cancel(job_id:str)->dict:
-        """Cancel the owned CAD job process group."""
+        """Cancel the owned durable CAD review job and its child process group."""
         from engineering_utils.cad.workflow import job_store
         return job_store().cancel(job_id)
+
+    @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+    def cad_concept_preview(basis_path:str,blocks_root:str,request:dict[str,Any])->dict:
+        """Resolve a bounded concept proposal without the CAD kernel; return hashes and impact counts.
+
+        Call with current expected_basis_hash and expected_compiled_input_hash.
+        Equipment parameters remain sourced or assumed; no clearance or issue pass
+        is inferred from the preview. Full arrays belong in cad_concept_export.
+        """
+        from engineering_utils.cad.concept import preview,summary
+        basis,interfaces=_load(basis_path,blocks_root)
+        return summary(preview(basis,interfaces,request)[0])
+
+    @mcp.tool(annotations=_ann(readOnlyHint=False, destructiveHint=False, idempotentHint=False))
+    def cad_concept_export(basis_path:str,blocks_root:str,out_dir:str,request:dict[str,Any],renderer_bundle:str|None=None)->dict:
+        """Save an immutable concept scene, source snapshots and resumable edit proposal.
+
+        Optional renderer_bundle is the shared built concept-offline.js; produces
+        a standalone read-only HTML viewer with PNG export. Existing outputs are
+        refused. Application uses the shared concept CLI apply, with source CAS
+        and the existing typed edit gates; this tool never edits the live basis.
+        """
+        from engineering_utils.cad.concept import export
+        return export(basis_path,blocks_root,out_dir,request,renderer_bundle=renderer_bundle)
 
     @mcp.tool(annotations=_ann(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
     def cad_basis_validate(ctx: Context, basis_path: str, blocks_root: str) -> list[TextContent]:
